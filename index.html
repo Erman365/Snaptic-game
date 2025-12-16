@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Multiplayer Building Game</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <!-- Login/Customization Screen -->
+    <div id="login-screen">
+        <div id="login-panel">
+            <h1>3D Multiplayer Building Game</h1>
+            <div class="form-group">
+                <label for="player-name">Your Name:</label>
+                <input type="text" id="player-name" placeholder="Enter your name" maxlength="20" />
+            </div>
+            <div class="form-group">
+                <label>Body Color:</label>
+                <div id="color-picker">
+                    <div class="color-option" data-color="0x4a9eff" style="background: #4a9eff;"></div>
+                    <div class="color-option" data-color="0xff6b6b" style="background: #ff6b6b;"></div>
+                    <div class="color-option" data-color="0x51cf66" style="background: #51cf66;"></div>
+                    <div class="color-option" data-color="0xffd93d" style="background: #ffd93d;"></div>
+                    <div class="color-option" data-color="0xa78bfa" style="background: #a78bfa;"></div>
+                    <div class="color-option" data-color="0xfb7185" style="background: #fb7185;"></div>
+                    <div class="color-option" data-color="0x60a5fa" style="background: #60a5fa;"></div>
+                    <div class="color-option" data-color="0x34d399" style="background: #34d399;"></div>
+                    <div class="color-option" data-color="0xfbbf24" style="background: #fbbf24;"></div>
+                    <div class="color-option" data-color="0xf472b6" style="background: #f472b6;"></div>
+                    <div class="color-option" data-color="0x818cf8" style="background: #818cf8;"></div>
+                    <div class="color-option" data-color="0xffffff" style="background: #ffffff; border: 2px solid #ccc;"></div>
+                </div>
+            </div>
+            <div class="form-group">
+                <label>Hat:</label>
+                <div id="hat-selector">
+                    <div class="hat-option" data-hat="none">None</div>
+                    <div class="hat-option" data-hat="cap">🧢 Cap</div>
+                    <div class="hat-option" data-hat="tophat">🎩 Top Hat</div>
+                    <div class="hat-option" data-hat="crown">👑 Crown</div>
+                    <div class="hat-option" data-hat="helmet">⛑️ Helmet</div>
+                    <div class="hat-option" data-hat="cowboy">🤠 Cowboy</div>
+                </div>
+            </div>
+            <button id="start-game-btn">Start Game</button>
+        </div>
+    </div>
+
+    <div id="game-container" style="display: none;">
+        <div id="ui">
+            <div id="score">Players: 1</div>
+            <div id="chat-container">
+                <div id="chat-messages"></div>
+                <div id="chat-input-container">
+                    <input type="text" id="chat-input" placeholder="Type a message... (Press Enter to send)" />
+                </div>
+            </div>
+            <div id="building-menu">
+                <div class="block-selector" data-block="grass">🌱 Grass</div>
+                <div class="block-selector" data-block="stone">🪨 Stone</div>
+                <div class="block-selector" data-block="wood">🪵 Wood</div>
+                <div class="block-selector" data-block="brick">🧱 Brick</div>
+                <div class="block-selector active" data-block="dirt">🟫 Dirt</div>
+            </div>
+            <div id="instructions">
+                <p><strong>WASD</strong> - Move | <strong>Shift</strong> - Sprint | <strong>Space</strong> - Jump | <strong>Right Click + Drag</strong> - Look around</p>
+                <p><strong>Q</strong> - Toggle Mode | <strong>Left Click</strong> - Place/Delete block</p>
+            </div>
+        </div>
+        <canvas id="game-canvas"></canvas>
+    </div>
+    <script src="https://cdn.socket.io/4.6.1/socket.io.min.js"></script>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+    <script type="module" src="game.js"></script>
+</body>
+</html>
+
+
