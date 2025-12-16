@@ -44,6 +44,9 @@ const maxCameraDistance = 20;
 const cameraHeight = 4;
 let cameraAngle = 0;
 let cameraPitch = 0.3;
+let cameraLocked = false; // Camera lock state
+let pauseMenuOpen = false; // Pause menu state (UI only, game continues running)
+let masterVolume = 1.0; // Master volume (0.0 to 1.0)
 
 // Block types with colors
 const BLOCK_TYPES = {
@@ -163,6 +166,7 @@ function init() {
     setupChat();
     setupBuildingMenu();
     setupLoginScreen();
+    setupPauseMenu();
 
     // Start animation loop (game will start after login)
     animate();
@@ -786,7 +790,7 @@ function setupControls() {
                 }
                 // E key does nothing outside inventory (only cycles items in inventory)
                 break;
-            case 'KeyI':
+            case 'KeyF':
                 // Don't process if typing in chat or name input
                 if (document.activeElement && (document.activeElement.id === 'chat-input' || document.activeElement.id === 'name-input')) {
                     return;
@@ -813,6 +817,33 @@ function setupControls() {
             case 'ShiftRight':
                 moveState.sprint = true;
                 break;
+            case 'ControlLeft':
+            case 'ControlRight':
+                // Toggle camera lock with pointer lock (like Roblox)
+                if (!pauseMenuOpen) { // Don't allow camera lock when pause menu is open
+                    const canvas = getCanvas();
+                    if (canvas) {
+                        if (!cameraLocked) {
+                            // Enable camera lock and request pointer lock (cursor gets locked to center)
+                            cameraLocked = true;
+                            canvas.requestPointerLock().catch(() => {
+                                console.log('Pointer lock failed');
+                                cameraLocked = false;
+                            });
+                        } else {
+                            // Disable camera lock and exit pointer lock
+                            cameraLocked = false;
+                            document.exitPointerLock();
+                        }
+                    }
+                }
+                e.preventDefault();
+                break;
+            case 'Escape':
+                // Toggle pause menu
+                togglePauseMenu();
+                e.preventDefault();
+                break;
         }
     });
 
@@ -838,40 +869,87 @@ function setupControls() {
             case 'ShiftRight':
                 moveState.sprint = false;
                 break;
+            case 'ControlLeft':
+            case 'ControlRight':
+                // Don't unlock on keyup - let pointer lock handle it
+                break;
         }
     });
 
-    // Mouse controls for camera (no pointer lock)
+    // Mouse controls for camera
     let lastMouseX = 0;
     let lastMouseY = 0;
     let isMouseDown = false;
     
-    document.addEventListener('mousedown', (e) => {
-        if (e.target.id === 'game-canvas') {
-            // Only handle camera movement on right click
-            if (e.button === 2) {
-            isMouseDown = true;
-            lastMouseX = e.clientX;
-            lastMouseY = e.clientY;
-            }
+    // Get canvas element
+    const getCanvas = () => document.getElementById('game-canvas');
+    
+    // Track mouse position for camera lock (without pointer lock, cursor stays visible)
+    let lockedMouseX = 0;
+    let lockedMouseY = 0;
+    
+    // Pointer lock change event
+    document.addEventListener('pointerlockchange', () => {
+        const canvas = getCanvas();
+        if (canvas && document.pointerLockElement === canvas) {
+            // Pointer is locked
+            cameraLocked = true;
+        } else {
+            // Pointer is unlocked
+            cameraLocked = false;
         }
     });
-
-    document.addEventListener('mouseup', (e) => {
-        if (e.button === 2) {
-        isMouseDown = false;
-        }
+    
+    // Pointer lock error handling
+    document.addEventListener('pointerlockerror', () => {
+        console.log('Pointer lock failed');
+        cameraLocked = false;
     });
-
+    
+    // Mouse movement - track continuously when camera is locked
     document.addEventListener('mousemove', (e) => {
-        if (isMouseDown && e.target.id === 'game-canvas') {
+        if (cameraLocked) {
+            // When locked, use movementX/Y from pointer lock (cursor is locked to center)
+            const deltaX = e.movementX || 0;
+            const deltaY = e.movementY || 0;
+            cameraAngle -= deltaX * 0.002;
+            cameraPitch += deltaY * 0.002;
+            cameraPitch = Math.max(-Math.PI / 3, Math.min(Math.PI / 3, cameraPitch));
+        } else if (isMouseDown && e.target.id === 'game-canvas') {
+            // Right-click drag camera (when not locked)
             const deltaX = e.clientX - lastMouseX;
             const deltaY = e.clientY - lastMouseY;
             cameraAngle -= deltaX * 0.002;
-            cameraPitch += deltaY * 0.002; // Fixed: inverted the sign for correct up/down
+            cameraPitch += deltaY * 0.002;
             cameraPitch = Math.max(-Math.PI / 3, Math.min(Math.PI / 3, cameraPitch));
             lastMouseX = e.clientX;
             lastMouseY = e.clientY;
+        }
+    });
+    
+    document.addEventListener('mousedown', (e) => {
+        if (e.target.id === 'game-canvas') {
+            // Only handle camera movement on right click (when not locked)
+            if (e.button === 2 && !cameraLocked) {
+                isMouseDown = true;
+                lastMouseX = e.clientX;
+                lastMouseY = e.clientY;
+                e.preventDefault(); // Prevent context menu
+            }
+        }
+    });
+    
+    // Prevent context menu on canvas (already handled globally, but ensure it works)
+    const canvas = getCanvas();
+    if (canvas) {
+        canvas.addEventListener('contextmenu', (e) => {
+            e.preventDefault();
+        });
+    }
+
+    document.addEventListener('mouseup', (e) => {
+        if (e.button === 2) {
+            isMouseDown = false;
         }
     });
 
@@ -1933,12 +2011,23 @@ function animateStickman(player, delta) {
         return;
     }
     
+    // Check if player is jumping or falling - jump animation takes priority
+    const isJumpingOrFalling = player.userData.isJumping || (player === localPlayer && !canJump && velocity.y !== 0);
+    
+    // Skip walking animation if jumping/falling (jump animation handles it)
+    if (isJumpingOrFalling) {
+        return;
+    }
+    
     if (!player.userData.isMoving) {
         // Smoothly return to default pose
         if (!player.userData.animationTime) player.userData.animationTime = 0;
         player.userData.animationTime *= 0.9; // Decay animation
         
         // Reset arms (rotate arm groups back to default - straight down)
+        // But preserve swing offset if swinging an item
+        const swingOffset = player.userData.swingOffset || 0;
+        
         // Arms are rotated 180 degrees, so default is 0
         if (player.userData.leftArmGroup) {
             player.userData.leftArmGroup.rotation.x = THREE.MathUtils.lerp(player.userData.leftArmGroup.rotation.x, 0, 0.1);
@@ -1949,10 +2038,14 @@ function animateStickman(player, delta) {
             }
         }
         if (player.userData.rightArmGroup) {
-            player.userData.rightArmGroup.rotation.x = THREE.MathUtils.lerp(player.userData.rightArmGroup.rotation.x, 0, 0.1);
+            // Apply swing offset even when not moving (for item use animation) - stronger animation
+            player.userData.rightArmGroup.rotation.x = THREE.MathUtils.lerp(player.userData.rightArmGroup.rotation.x, swingOffset, 0.3);
             player.userData.rightArmGroup.position.z = THREE.MathUtils.lerp(player.userData.rightArmGroup.position.z, 0, 0.1);
             if (player.userData.rightForearm) {
-                player.userData.rightForearm.rotation.x = THREE.MathUtils.lerp(player.userData.rightForearm.rotation.x, 0, 0.1);
+                // Add swing offset to elbow bend - stronger when standing still
+                const baseElbowBend = 0;
+                const swingElbowBend = Math.abs(swingOffset) * 0.6; // Increased from 0.3 to 0.6 for stronger animation
+                player.userData.rightForearm.rotation.x = THREE.MathUtils.lerp(player.userData.rightForearm.rotation.x, baseElbowBend + swingElbowBend, 0.3);
                 player.userData.rightForearm.position.z = THREE.MathUtils.lerp(player.userData.rightForearm.position.z, -0.02, 0.1); // Reset forearm back position
             }
         }
@@ -2005,14 +2098,23 @@ function animateStickman(player, delta) {
     const legSwingAmplitude = 0.6; // Consistent swing range
     const legSwing = Math.sin(player.userData.animationTime) * legSwingAmplitude;
     
-    // Move legs back slightly when sprinting
-    const targetLegBackOffset = isSprinting ? -0.1 : 0;
+    // Calculate pivot offsets based on torso lean angle
+    // When torso leans forward, hips (below center) move back, shoulders (above center) move forward
+    // Body center is at y=0.65, shoulders at y=1.0 (0.35 above), hips at y=0.5 (0.15 below)
+    const sprintLeanAngle = isSprinting ? Math.PI / 9 : 0; // 20 degrees when sprinting
+    const shoulderHeight = 1.0 - 0.65; // 0.35 above body center
+    const hipHeight = 0.5 - 0.65; // -0.15 below body center (negative)
+    
+    // Shoulders move forward when leaning: forward offset = height * sin(angle)
+    const targetShoulderForwardOffset = shoulderHeight * Math.sin(sprintLeanAngle);
+    // Hips move back when leaning: backward offset = height * sin(angle) (height is negative, so this is backward)
+    const targetHipBackOffset = hipHeight * Math.sin(sprintLeanAngle);
     
     // Left leg group swings forward/back
     if (player.userData.leftLegGroup) {
         player.userData.leftLegGroup.rotation.x = legSwing;
-        // Move leg back when sprinting - smooth transition
-        player.userData.leftLegGroup.position.z = THREE.MathUtils.lerp(player.userData.leftLegGroup.position.z, targetLegBackOffset, 0.2);
+        // Move hip pivot back when sprinting (to align with torso lean) - smooth transition
+        player.userData.leftLegGroup.position.z = THREE.MathUtils.lerp(player.userData.leftLegGroup.position.z, 0.05 + targetHipBackOffset, 0.2);
         // Knee bend - shin rotates relative to thigh (increased swing)
         if (player.userData.leftShin) {
             player.userData.leftShin.rotation.x = Math.abs(legSwing) * 0.8; // Increased bend when leg is forward
@@ -2022,8 +2124,8 @@ function animateStickman(player, delta) {
     // Right leg group (opposite phase - swings opposite to left)
     if (player.userData.rightLegGroup) {
         player.userData.rightLegGroup.rotation.x = -legSwing;
-        // Move leg back when sprinting - smooth transition
-        player.userData.rightLegGroup.position.z = THREE.MathUtils.lerp(player.userData.rightLegGroup.position.z, targetLegBackOffset, 0.2);
+        // Move hip pivot back when sprinting (to align with torso lean) - smooth transition
+        player.userData.rightLegGroup.position.z = THREE.MathUtils.lerp(player.userData.rightLegGroup.position.z, 0.05 + targetHipBackOffset, 0.2);
         // Knee bend (increased swing)
         // Move shin back slightly to align joints
         if (player.userData.rightShin) {
@@ -2039,16 +2141,12 @@ function animateStickman(player, delta) {
     const armSwingAmplitude = 0.6; // Same amplitude as legs for consistency
     const armSwing = Math.sin(player.userData.animationTime) * armSwingAmplitude;
     
-    // Calculate forward offset for arms when sprinting (shoulder level moves forward with body lean)
-    // Shoulder is at y = 1.0, body center is at y = 0.65, so shoulder is 0.35 above center
-    // Forward offset = (shoulder y - body center y) * sin(20°)
-    const targetShoulderForwardOffset = isSprinting ? (1.0 - 0.65) * Math.sin(Math.PI / 9) : 0;
-    
     // Left arm group (swings with right leg - opposite phase to left leg)
     if (player.userData.leftArmGroup) {
         player.userData.leftArmGroup.rotation.x = -armSwing; // Opposite to left leg (when left leg forward, left arm back)
-        // Move arm forward when sprinting - smooth transition
-        player.userData.leftArmGroup.position.z = THREE.MathUtils.lerp(player.userData.leftArmGroup.position.z, targetShoulderForwardOffset, 0.2);
+        // Move shoulder pivot forward when sprinting (to align with torso lean) - smooth transition
+        // Base position is -0.05, add forward offset based on lean
+        player.userData.leftArmGroup.position.z = THREE.MathUtils.lerp(player.userData.leftArmGroup.position.z, -0.05 + targetShoulderForwardOffset, 0.2);
         // Elbow bend - forearm rotates relative to upper arm (increased swing)
         // Move forearm back slightly to align joints
         if (player.userData.leftForearm) {
@@ -2060,13 +2158,21 @@ function animateStickman(player, delta) {
     
     // Right arm group (swings with left leg - opposite phase to right leg)
     if (player.userData.rightArmGroup) {
-        player.userData.rightArmGroup.rotation.x = armSwing; // Opposite to right leg (when right leg forward, right arm back)
-        // Move arm forward when sprinting - smooth transition
-        player.userData.rightArmGroup.position.z = THREE.MathUtils.lerp(player.userData.rightArmGroup.position.z, targetShoulderForwardOffset, 0.2);
+        // Get swing offset from item use animation (if any)
+        const swingOffset = player.userData.swingOffset || 0;
+        
+        // Add swing offset to walking animation (item use adds to walking, doesn't replace it)
+        player.userData.rightArmGroup.rotation.x = armSwing + swingOffset; // Opposite to right leg (when right leg forward, right arm back)
+        // Move shoulder pivot forward when sprinting (to align with torso lean) - smooth transition
+        // Base position is -0.05, add forward offset based on lean
+        player.userData.rightArmGroup.position.z = THREE.MathUtils.lerp(player.userData.rightArmGroup.position.z, -0.05 + targetShoulderForwardOffset, 0.2);
         // Elbow bend (increased swing)
         // Move forearm back slightly to align joints
         if (player.userData.rightForearm) {
-            player.userData.rightForearm.rotation.x = Math.abs(armSwing) * 0.6; // Increased elbow bend
+            // Add swing offset to elbow bend as well for more natural movement
+            const baseElbowBend = Math.abs(armSwing) * 0.6;
+            const swingElbowBend = Math.abs(swingOffset) * 0.3; // Additional bend from swing
+            player.userData.rightForearm.rotation.x = baseElbowBend + swingElbowBend;
             // Move forearm back to align joints
             player.userData.rightForearm.position.z = -0.02; // Small backward offset to align joints
         }
@@ -2130,18 +2236,18 @@ function updateBuildModeUI() {
         if (buildMode === 'build') {
             instructions.innerHTML = `
                 <p><strong>WASD</strong> - Move | <strong>Shift</strong> - Sprint | <strong>Space</strong> - Jump | <strong>Right Click + Drag</strong> - Look around</p>
-                <p><strong>Q</strong> - Cycle Mode | <strong>I</strong> - Inventory | <strong>Left Click</strong> - Place block | <strong>Mode: BUILD</strong></p>
+                <p><strong>Q</strong> - Cycle Mode | <strong>F</strong> - Inventory | <strong>Left Click</strong> - Place block | <strong>Mode: BUILD</strong></p>
             `;
         } else if (buildMode === 'delete') {
             instructions.innerHTML = `
                 <p><strong>WASD</strong> - Move | <strong>Shift</strong> - Sprint | <strong>Space</strong> - Jump | <strong>Right Click + Drag</strong> - Look around</p>
-                <p><strong>Q</strong> - Cycle Mode | <strong>I</strong> - Inventory | <strong>Left Click</strong> - Delete block | <strong>Mode: DELETE</strong></p>
+                <p><strong>Q</strong> - Cycle Mode | <strong>F</strong> - Inventory | <strong>Left Click</strong> - Delete block | <strong>Mode: DELETE</strong></p>
             `;
         } else {
             const itemName = localPlayer && localPlayer.userData.equippedItem ? localPlayer.userData.equippedItem : 'None';
             instructions.innerHTML = `
                 <p><strong>WASD</strong> - Move | <strong>Shift</strong> - Sprint | <strong>Space</strong> - Jump | <strong>Right Click + Drag</strong> - Look around</p>
-                <p><strong>Q</strong> - Cycle Mode | <strong>I</strong> - Inventory | <strong>Left Click</strong> - Use ${itemName} | <strong>Mode: ITEM</strong></p>
+                <p><strong>Q</strong> - Cycle Mode | <strong>F</strong> - Inventory | <strong>Left Click</strong> - Use ${itemName} | <strong>Mode: ITEM</strong></p>
             `;
         }
     }
@@ -2557,17 +2663,25 @@ function jumpAnimation(player) {
             if (player.userData.rightShin) {
                 player.userData.rightShin.rotation.x = -crouchAmount * 0.6;
             }
-            // Arms go back during crouch
+            // Arms go back during crouch, and bend elbows
             if (player.userData.leftArmGroup) {
                 player.userData.leftArmGroup.rotation.x = originalLeftArmRot + crouchAmount * 0.3;
+                // Bend elbow during crouch
+                if (player.userData.leftForearm) {
+                    player.userData.leftForearm.rotation.x = crouchAmount * 0.5;
+                }
             }
             if (player.userData.rightArmGroup) {
                 player.userData.rightArmGroup.rotation.x = originalRightArmRot + crouchAmount * 0.3;
+                // Bend elbow during crouch
+                if (player.userData.rightForearm) {
+                    player.userData.rightForearm.rotation.x = crouchAmount * 0.5;
+                }
             }
             
             requestAnimationFrame(jumpAnim);
         } else if (player.userData.jumpTime < 0.35) {
-            // Jump phase - extend legs and lift arms up
+            // Jump phase - extend legs and lift arms up and sideways
             const jumpProgress = (player.userData.jumpTime - 0.12) / 0.23;
             const jumpAmount = Math.sin(jumpProgress * Math.PI) * 0.5; // More dramatic extension
             
@@ -2577,26 +2691,39 @@ function jumpAnimation(player) {
             if (player.userData.rightLegGroup) {
                 player.userData.rightLegGroup.rotation.x = originalRightLegRot + jumpAmount;
             }
-            // Arms lift up during jump
+            // Arms lift up and go sideways during jump (not too much)
+            const armLiftAmount = jumpAmount * 0.8;
+            const armSidewaysAmount = Math.sin(jumpProgress * Math.PI) * 0.3; // Sideways movement (not too much)
             if (player.userData.leftArmGroup) {
-                player.userData.leftArmGroup.rotation.x = originalLeftArmRot - jumpAmount * 0.8;
+                player.userData.leftArmGroup.rotation.x = originalLeftArmRot - armLiftAmount;
+                player.userData.leftArmGroup.rotation.z = -armSidewaysAmount; // Left arm swings left (negative)
+                // Bend elbow during jump
+                if (player.userData.leftForearm) {
+                    player.userData.leftForearm.rotation.x = armLiftAmount * 0.4;
+                }
             }
             if (player.userData.rightArmGroup) {
-                player.userData.rightArmGroup.rotation.x = originalRightArmRot - jumpAmount * 0.8;
+                player.userData.rightArmGroup.rotation.x = originalRightArmRot - armLiftAmount;
+                player.userData.rightArmGroup.rotation.z = armSidewaysAmount; // Right arm swings right (positive)
+                // Bend elbow during jump
+                if (player.userData.rightForearm) {
+                    player.userData.rightForearm.rotation.x = armLiftAmount * 0.4;
+                }
             }
             if (player.userData.body) {
                 player.userData.body.position.y = originalBodyY + jumpAmount * 0.15;
             }
+            // Bend knees during jump extension
             if (player.userData.leftShin) {
-                player.userData.leftShin.rotation.x = jumpAmount * 0.4;
+                player.userData.leftShin.rotation.x = jumpAmount * 0.6; // More knee bend
             }
             if (player.userData.rightShin) {
-                player.userData.rightShin.rotation.x = jumpAmount * 0.4;
+                player.userData.rightShin.rotation.x = jumpAmount * 0.6; // More knee bend
             }
             
             requestAnimationFrame(jumpAnim);
         } else if (player.userData.jumpTime < 0.8) {
-            // Air phase - tuck legs, maintain arm position
+            // Air phase - tuck legs, maintain arm position with sideways movement
             const airProgress = (player.userData.jumpTime - 0.35) / 0.45;
             const tuckAmount = Math.sin(airProgress * Math.PI) * 0.3; // Tuck legs in air
             
@@ -2606,12 +2733,30 @@ function jumpAnimation(player) {
             if (player.userData.rightLegGroup) {
                 player.userData.rightLegGroup.rotation.x = originalRightLegRot + 0.2 - tuckAmount;
             }
-            // Arms stay up
+            // Arms stay up with sideways movement (not too much)
+            const armSideways = Math.sin(airProgress * Math.PI) * 0.25; // Sideways in air
             if (player.userData.leftArmGroup) {
                 player.userData.leftArmGroup.rotation.x = originalLeftArmRot - 0.3 * (1 - airProgress * 0.5);
+                player.userData.leftArmGroup.rotation.z = -armSideways; // Left arm swings left (negative)
+                // Keep elbow bent
+                if (player.userData.leftForearm) {
+                    player.userData.leftForearm.rotation.x = 0.3 * 0.4;
+                }
             }
             if (player.userData.rightArmGroup) {
                 player.userData.rightArmGroup.rotation.x = originalRightArmRot - 0.3 * (1 - airProgress * 0.5);
+                player.userData.rightArmGroup.rotation.z = armSideways; // Right arm swings right (positive)
+                // Keep elbow bent
+                if (player.userData.rightForearm) {
+                    player.userData.rightForearm.rotation.x = 0.3 * 0.4;
+                }
+            }
+            // Keep knees bent in air
+            if (player.userData.leftShin) {
+                player.userData.leftShin.rotation.x = 0.3;
+            }
+            if (player.userData.rightShin) {
+                player.userData.rightShin.rotation.x = 0.3;
             }
             
             requestAnimationFrame(jumpAnim);
@@ -2625,9 +2770,18 @@ function jumpAnimation(player) {
             }
             if (player.userData.leftArmGroup) {
                 player.userData.leftArmGroup.rotation.x = originalLeftArmRot;
+                player.userData.leftArmGroup.rotation.z = 0; // Reset sideways
             }
             if (player.userData.rightArmGroup) {
                 player.userData.rightArmGroup.rotation.x = originalRightArmRot;
+                player.userData.rightArmGroup.rotation.z = 0; // Reset sideways
+            }
+            // Reset elbow rotations
+            if (player.userData.leftForearm) {
+                player.userData.leftForearm.rotation.x = 0;
+            }
+            if (player.userData.rightForearm) {
+                player.userData.rightForearm.rotation.x = 0;
             }
             if (player.userData.body) {
                 player.userData.body.position.y = originalBodyY;
@@ -2776,24 +2930,33 @@ function useItem(player) {
 function swingSword(player) {
     if (!player.userData.rightArmGroup) return;
     
-    const originalRotation = player.userData.rightArmGroup.rotation.x;
-    let swingProgress = 0;
+    // Initialize swing offset if not exists
+    if (!player.userData.swingOffset) player.userData.swingOffset = 0;
+    if (!player.userData.swingTime) player.userData.swingTime = 0;
+    player.userData.isSwinging = true;
+    
+    // Reset swing animation
+    player.userData.swingTime = 0;
     
     const animate = () => {
-        swingProgress += 0.05;
-        if (swingProgress < 0.3) {
+        if (!player.userData.isSwinging) return;
+        
+        player.userData.swingTime += 0.05;
+        if (player.userData.swingTime < 0.3) {
             // Swing forward (negative rotation swings forward since arms are rotated 180)
-            const swingAmount = Math.sin(swingProgress * Math.PI / 0.3) * 1.2;
-            player.userData.rightArmGroup.rotation.x = originalRotation - swingAmount; // Negative for forward swing
+            const swingAmount = Math.sin(player.userData.swingTime * Math.PI / 0.3) * 1.2;
+            player.userData.swingOffset = -swingAmount; // Negative for forward swing
             requestAnimationFrame(animate);
-        } else if (swingProgress < 0.6) {
+        } else if (player.userData.swingTime < 0.6) {
             // Swing back
-            const t = (swingProgress - 0.3) / 0.3;
+            const t = (player.userData.swingTime - 0.3) / 0.3;
             const swingAmount = 1.2 * (1 - t);
-            player.userData.rightArmGroup.rotation.x = originalRotation - swingAmount;
+            player.userData.swingOffset = -swingAmount;
             requestAnimationFrame(animate);
         } else {
-            player.userData.rightArmGroup.rotation.x = originalRotation;
+            // Reset swing offset
+            player.userData.swingOffset = 0;
+            player.userData.isSwinging = false;
         }
     };
     animate();
@@ -3326,6 +3489,352 @@ function setupLoginScreen() {
     });
 }
 
+// Setup pause menu (UI only - game continues running in multiplayer)
+function setupPauseMenu() {
+    // Create pause menu container
+    const pauseMenu = document.createElement('div');
+    pauseMenu.id = 'pause-menu';
+    pauseMenu.style.cssText = `
+        position: fixed;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        background: rgba(0, 0, 0, 0.8);
+        display: none;
+        justify-content: center;
+        align-items: center;
+        z-index: 10000;
+    `;
+    
+    // Create menu panel
+    const menuPanel = document.createElement('div');
+    menuPanel.style.cssText = `
+        background: rgba(255, 255, 255, 0.95);
+        padding: 40px;
+        border-radius: 20px;
+        box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+        min-width: 400px;
+        max-width: 600px;
+        width: 90%;
+    `;
+    
+    // Title
+    const title = document.createElement('h2');
+    title.textContent = 'Menu';
+    title.style.cssText = `
+        text-align: center;
+        color: #333;
+        margin-bottom: 30px;
+        font-size: 32px;
+    `;
+    menuPanel.appendChild(title);
+    
+    // Tabs container
+    const tabsContainer = document.createElement('div');
+    tabsContainer.style.cssText = `
+        display: flex;
+        gap: 10px;
+        margin-bottom: 20px;
+        border-bottom: 2px solid #ddd;
+    `;
+    
+    // Tab buttons
+    const settingsTab = document.createElement('button');
+    settingsTab.textContent = 'Settings';
+    settingsTab.className = 'pause-tab active';
+    settingsTab.style.cssText = `
+        flex: 1;
+        padding: 12px;
+        border: none;
+        background: transparent;
+        cursor: pointer;
+        font-size: 16px;
+        font-weight: bold;
+        color: #667eea;
+        border-bottom: 3px solid #667eea;
+        transition: all 0.2s;
+    `;
+    
+    const menuTab = document.createElement('button');
+    menuTab.textContent = 'Return to Menu';
+    menuTab.className = 'pause-tab';
+    menuTab.style.cssText = `
+        flex: 1;
+        padding: 12px;
+        border: none;
+        background: transparent;
+        cursor: pointer;
+        font-size: 16px;
+        font-weight: bold;
+        color: #666;
+        border-bottom: 3px solid transparent;
+        transition: all 0.2s;
+    `;
+    
+    const resetTab = document.createElement('button');
+    resetTab.textContent = 'Reset';
+    resetTab.className = 'pause-tab';
+    resetTab.style.cssText = `
+        flex: 1;
+        padding: 12px;
+        border: none;
+        background: transparent;
+        cursor: pointer;
+        font-size: 16px;
+        font-weight: bold;
+        color: #666;
+        border-bottom: 3px solid transparent;
+        transition: all 0.2s;
+    `;
+    
+    tabsContainer.appendChild(settingsTab);
+    tabsContainer.appendChild(menuTab);
+    tabsContainer.appendChild(resetTab);
+    menuPanel.appendChild(tabsContainer);
+    
+    // Content container
+    const contentContainer = document.createElement('div');
+    contentContainer.id = 'pause-content';
+    contentContainer.style.cssText = `
+        min-height: 200px;
+    `;
+    
+    // Settings content
+    const settingsContent = document.createElement('div');
+    settingsContent.id = 'settings-content';
+    settingsContent.style.cssText = `
+        display: block;
+    `;
+    
+    const volumeLabel = document.createElement('label');
+    volumeLabel.textContent = 'Master Volume';
+    volumeLabel.style.cssText = `
+        display: block;
+        margin-bottom: 10px;
+        color: #333;
+        font-weight: bold;
+        font-size: 14px;
+    `;
+    settingsContent.appendChild(volumeLabel);
+    
+    const volumeContainer = document.createElement('div');
+    volumeContainer.style.cssText = `
+        display: flex;
+        align-items: center;
+        gap: 15px;
+        margin-bottom: 20px;
+    `;
+    
+    const volumeSlider = document.createElement('input');
+    volumeSlider.type = 'range';
+    volumeSlider.min = '0';
+    volumeSlider.max = '100';
+    volumeSlider.value = '100';
+    volumeSlider.style.cssText = `
+        flex: 1;
+        height: 8px;
+    `;
+    
+    const volumeValue = document.createElement('span');
+    volumeValue.textContent = '100%';
+    volumeValue.style.cssText = `
+        min-width: 50px;
+        text-align: right;
+        color: #333;
+        font-weight: bold;
+    `;
+    
+    volumeSlider.addEventListener('input', (e) => {
+        const value = parseInt(e.target.value);
+        volumeValue.textContent = value + '%';
+        masterVolume = value / 100;
+        updateVolume();
+    });
+    
+    volumeContainer.appendChild(volumeSlider);
+    volumeContainer.appendChild(volumeValue);
+    settingsContent.appendChild(volumeContainer);
+    
+    // Menu content
+    const menuContent = document.createElement('div');
+    menuContent.id = 'menu-content';
+    menuContent.style.cssText = `
+        display: none;
+        text-align: center;
+    `;
+    
+    const menuText = document.createElement('p');
+    menuText.textContent = 'Return to the character creation screen?';
+    menuText.style.cssText = `
+        color: #333;
+        margin-bottom: 20px;
+        font-size: 16px;
+    `;
+    menuContent.appendChild(menuText);
+    
+    const returnButton = document.createElement('button');
+    returnButton.textContent = 'Return to Menu';
+    returnButton.style.cssText = `
+        padding: 12px 30px;
+        background: #667eea;
+        color: white;
+        border: none;
+        border-radius: 8px;
+        font-size: 16px;
+        font-weight: bold;
+        cursor: pointer;
+        transition: background 0.2s;
+    `;
+    returnButton.addEventListener('mouseenter', () => {
+        returnButton.style.background = '#5568d3';
+    });
+    returnButton.addEventListener('mouseleave', () => {
+        returnButton.style.background = '#667eea';
+    });
+    returnButton.addEventListener('click', () => {
+        returnToMenu();
+    });
+    menuContent.appendChild(returnButton);
+    
+    // Reset content
+    const resetContent = document.createElement('div');
+    resetContent.id = 'reset-content';
+    resetContent.style.cssText = `
+        display: none;
+        text-align: center;
+    `;
+    
+    const resetText = document.createElement('p');
+    resetText.textContent = 'Kill yourself and respawn?';
+    resetText.style.cssText = `
+        color: #333;
+        margin-bottom: 20px;
+        font-size: 16px;
+    `;
+    resetContent.appendChild(resetText);
+    
+    const resetButton = document.createElement('button');
+    resetButton.textContent = 'Reset (Kill Player)';
+    resetButton.style.cssText = `
+        padding: 12px 30px;
+        background: #ff6b6b;
+        color: white;
+        border: none;
+        border-radius: 8px;
+        font-size: 16px;
+        font-weight: bold;
+        cursor: pointer;
+        transition: background 0.2s;
+    `;
+    resetButton.addEventListener('mouseenter', () => {
+        resetButton.style.background = '#ee5a5a';
+    });
+    resetButton.addEventListener('mouseleave', () => {
+        resetButton.style.background = '#ff6b6b';
+    });
+    resetButton.addEventListener('click', () => {
+        killPlayer();
+        togglePauseMenu();
+    });
+    resetContent.appendChild(resetButton);
+    
+    contentContainer.appendChild(settingsContent);
+    contentContainer.appendChild(menuContent);
+    contentContainer.appendChild(resetContent);
+    menuPanel.appendChild(contentContainer);
+    
+    pauseMenu.appendChild(menuPanel);
+    document.body.appendChild(pauseMenu);
+    
+    // Tab switching
+    const tabs = [settingsTab, menuTab, resetTab];
+    const contents = [settingsContent, menuContent, resetContent];
+    
+    tabs.forEach((tab, index) => {
+        tab.addEventListener('click', () => {
+            // Update tab styles
+            tabs.forEach(t => {
+                t.style.color = '#666';
+                t.style.borderBottomColor = 'transparent';
+                t.classList.remove('active');
+            });
+            tab.style.color = '#667eea';
+            tab.style.borderBottomColor = '#667eea';
+            tab.classList.add('active');
+            
+            // Update content visibility
+            contents.forEach(c => c.style.display = 'none');
+            contents[index].style.display = 'block';
+        });
+    });
+}
+
+// Toggle pause menu (UI only - game continues running)
+function togglePauseMenu() {
+    pauseMenuOpen = !pauseMenuOpen;
+    const pauseMenu = document.getElementById('pause-menu');
+    
+    if (pauseMenuOpen) {
+        pauseMenu.style.display = 'flex';
+        // Exit pointer lock if active
+        if (document.pointerLockElement) {
+            document.exitPointerLock();
+            cameraLocked = false;
+        }
+    } else {
+        pauseMenu.style.display = 'none';
+    }
+}
+
+// Update volume for all sounds
+function updateVolume() {
+    if (deathSound) deathSound.volume = 0.7 * masterVolume;
+    if (metalHitSound) metalHitSound.volume = 0.5 * masterVolume;
+    if (ragdollSound) ragdollSound.volume = 0.6 * masterVolume;
+}
+
+// Return to menu
+function returnToMenu() {
+    // Close pause menu
+    togglePauseMenu();
+    
+    // Disconnect from server
+    if (socket) {
+        socket.disconnect();
+        socket = null;
+    }
+    
+    // Hide game container
+    document.getElementById('game-container').style.display = 'none';
+    
+    // Show login screen
+    document.getElementById('login-screen').style.display = 'flex';
+    
+    // Clean up game state
+    if (localPlayer) {
+        scene.remove(localPlayer);
+        localPlayer = null;
+    }
+    otherPlayers.clear();
+    blocks.clear();
+    playerHealth = maxHealth;
+}
+
+// Kill player (reset)
+function killPlayer() {
+    if (!localPlayer || !socket) return;
+    
+    // Set health to 0 and notify server
+    playerHealth = 0;
+    if (socket) {
+        socket.emit('playerDamage', {
+            targetId: socket.id,
+            damage: 1000 // Massive damage to ensure death
+        });
+    }
+}
+
 // Connect to server
 function connectToServer() {
     // Automatically connect to the same host (works for both local and deployed)
@@ -3641,6 +4150,9 @@ function removeBlock(x, y, z) {
 function updatePlayerMovement(delta) {
     if (!localPlayer) return;
 
+    // Store intended movement direction for rotation (before collisions modify velocity)
+    let intendedDirection = null;
+
     // Skip movement controls if ragdoll is active, but still apply physics and collision
     if (!isRagdoll) {
         // Base speed increased by 30% (100 * 1.3 = 130)
@@ -3657,6 +4169,9 @@ function updatePlayerMovement(delta) {
 
     direction.normalize();
     direction.applyAxisAngle(new THREE.Vector3(0, 1, 0), cameraAngle);
+
+    // Store intended movement direction for rotation (before collisions modify velocity)
+    intendedDirection = direction.clone();
 
     // Apply movement
     velocity.x = direction.x * speed * delta;
@@ -3716,43 +4231,100 @@ function updatePlayerMovement(delta) {
             
             // Landing on top of block (from above or jumping up)
             if (feetY <= blockTop + 0.1 && feetY >= blockTop - 0.3 && velocity.y <= 0) {
-                // Check fall distance for ragdoll trigger (>10 blocks = 10 units)
-                const fallDistance = lastGroundY - (blockTop + 0.27);
-                if (fallDistance > 10 && !isRagdoll && lastGroundY > 0) {
-                    // Trigger ragdoll from fall
-                    triggerRagdoll(localPlayer, new THREE.Vector3(0, 0, 0));
-                    if (socket) {
-                        socket.emit('playerRagdoll', { 
-                            reason: 'fall',
-                            fallDistance: fallDistance
-                        });
-                    }
-                }
+                // Check if there's a block above this one - prevent wall-hopping
+                const blockX = Math.round(blockPos.x);
+                const blockZ = Math.round(blockPos.z);
+                const blockAboveY = gridY + 1;
+                const blockAboveKey = `${blockX},${blockAboveY},${blockZ}`;
                 
-                localPlayer.position.y = blockTop + 0.27; // Player center = block top + 0.27 (feet on block, lowered by 0.03)
-        velocity.y = 0;
-        canJump = true;
-                onGround = true;
-                lastGroundY = blockTop + 0.27; // Update last ground Y when landing
+                // Only allow landing if there's no block directly above
+                if (!blocks.has(blockAboveKey)) {
+                    // Check fall distance for ragdoll trigger (>10 blocks = 10 units)
+                    const fallDistance = lastGroundY - (blockTop + 0.27);
+                    if (fallDistance > 10 && !isRagdoll && lastGroundY > 0) {
+                        // Trigger ragdoll from fall
+                        triggerRagdoll(localPlayer, new THREE.Vector3(0, 0, 0));
+                        if (socket) {
+                            socket.emit('playerRagdoll', { 
+                                reason: 'fall',
+                                fallDistance: fallDistance
+                            });
+                        }
+                    }
+                    
+                    localPlayer.position.y = blockTop + 0.27; // Player center = block top + 0.27 (feet on block, lowered by 0.03)
+                    velocity.y = 0;
+                    canJump = true;
+                    onGround = true;
+                    lastGroundY = blockTop + 0.27; // Update last ground Y when landing
+                }
             }
             // Hitting ceiling of block
             else if (headY >= blockMin.y - 0.1 && headY <= blockMin.y + 0.3 && velocity.y > 0) {
                 localPlayer.position.y = blockMin.y - 1.35; // Player center = block bottom - 1.35
                 velocity.y = 0;
             }
-            // Side collision - push player away horizontally
+            // Side collision - push player away horizontally using proper AABB (rectangular) collision
             else if (headY > blockMin.y && feetY < blockMax.y) {
-                const pushX = localPlayer.position.x - blockPos.x;
-                const pushZ = localPlayer.position.z - blockPos.z;
-                const pushDist = Math.sqrt(pushX * pushX + pushZ * pushZ);
+                // Use proper AABB collision detection (rectangular, not cylindrical)
+                // Check if player is actually overlapping with block's rectangular bounds
+                const playerMinX = localPlayer.position.x - playerRadius;
+                const playerMaxX = localPlayer.position.x + playerRadius;
+                const playerMinZ = localPlayer.position.z - playerRadius;
+                const playerMaxZ = localPlayer.position.z + playerRadius;
                 
-                if (pushDist > 0.01) {
-                    const pushDirX = pushX / pushDist;
-                    const pushDirZ = pushZ / pushDist;
-                    localPlayer.position.x = blockPos.x + pushDirX * (0.5 + playerRadius);
-                    localPlayer.position.z = blockPos.z + pushDirZ * (0.5 + playerRadius);
-                    velocity.x *= 0.3; // Reduce horizontal velocity on collision
-                    velocity.z *= 0.3;
+                // Check for actual overlap in X and Z axes separately
+                const overlapX = Math.min(playerMaxX - blockMin.x, blockMax.x - playerMinX);
+                const overlapZ = Math.min(playerMaxZ - blockMin.z, blockMax.z - playerMinZ);
+                
+                // Only push if there's actual overlap (both X and Z overlap)
+                if (overlapX > 0 && overlapZ > 0) {
+                    // Determine which axis has the smallest overlap (push in that direction)
+                    let pushX = 0;
+                    let pushZ = 0;
+                    
+                    if (overlapX < overlapZ) {
+                        // Push in X direction (smaller overlap)
+                        if (localPlayer.position.x < blockPos.x) {
+                            // Player is to the left, push left
+                            pushX = -(overlapX + 0.01); // Small extra push to prevent re-collision
+                        } else {
+                            // Player is to the right, push right
+                            pushX = overlapX + 0.01;
+                        }
+                    } else {
+                        // Push in Z direction (smaller overlap)
+                        if (localPlayer.position.z < blockPos.z) {
+                            // Player is in front, push forward
+                            pushZ = -(overlapZ + 0.01);
+                        } else {
+                            // Player is behind, push backward
+                            pushZ = overlapZ + 0.01;
+                        }
+                    }
+                    
+                    // Apply the push
+                    localPlayer.position.x += pushX;
+                    localPlayer.position.z += pushZ;
+                    
+                    // Calculate wall normal based on push direction
+                    const pushLength = Math.sqrt(pushX * pushX + pushZ * pushZ);
+                    if (pushLength > 0.01) {
+                        const wallNormal = new THREE.Vector3(pushX / pushLength, 0, pushZ / pushLength);
+                        
+                        // Project velocity onto wall normal to get perpendicular component
+                        const dotProduct = velocity.x * wallNormal.x + velocity.z * wallNormal.z;
+                        const perpVelocityX = wallNormal.x * dotProduct;
+                        const perpVelocityZ = wallNormal.z * dotProduct;
+                        
+                        // Remove perpendicular component (bounce off wall), keep parallel component (slide along wall)
+                        velocity.x -= perpVelocityX * 1.2; // Slight bounce
+                        velocity.z -= perpVelocityZ * 1.2;
+                        
+                        // Clamp velocity to prevent sticking
+                        if (Math.abs(velocity.x) < 0.01) velocity.x = 0;
+                        if (Math.abs(velocity.z) < 0.01) velocity.z = 0;
+                    }
                 }
             }
         }
@@ -3827,13 +4399,11 @@ function updatePlayerMovement(delta) {
         }
     }
 
-    // Rotate player to face movement direction (smooth rotation)
-    const movementDirection = new THREE.Vector3(velocity.x, 0, velocity.z);
-    const isMoving = !isRagdoll && movementDirection.length() > 0.01;
-    localPlayer.userData.isMoving = isMoving;
-    if (isMoving) {
-        const targetAngle = Math.atan2(movementDirection.x, movementDirection.z);
-        // Handle angle wrapping to prevent 360 degree turns
+    // Rotate player based on camera when locked, otherwise face movement direction
+    if (cameraLocked) {
+        // When camera is locked, player rotates to face where camera is pointing (not backwards)
+        // Camera angle points behind player, so add PI to face forward
+        const targetAngle = cameraAngle + Math.PI; // Face where camera is pointing
         let currentAngle = localPlayer.rotation.y;
         let angleDiff = targetAngle - currentAngle;
         
@@ -3841,8 +4411,27 @@ function updatePlayerMovement(delta) {
         while (angleDiff > Math.PI) angleDiff -= 2 * Math.PI;
         while (angleDiff < -Math.PI) angleDiff += 2 * Math.PI;
         
-        // Smooth rotation using lerp on the normalized difference
-        localPlayer.rotation.y = currentAngle + angleDiff * 0.15;
+        // Smooth rotation to match camera
+        localPlayer.rotation.y = currentAngle + angleDiff * 0.2; // Faster rotation when locked
+        localPlayer.userData.isMoving = !isRagdoll && (intendedDirection !== null && intendedDirection.length() > 0.01);
+    } else {
+        // Normal behavior - rotate to face movement direction
+        const rotationDirection = intendedDirection || new THREE.Vector3(velocity.x, 0, velocity.z);
+        const isMoving = !isRagdoll && rotationDirection.length() > 0.01;
+        localPlayer.userData.isMoving = isMoving;
+        if (isMoving) {
+            const targetAngle = Math.atan2(rotationDirection.x, rotationDirection.z);
+            // Handle angle wrapping to prevent 360 degree turns
+            let currentAngle = localPlayer.rotation.y;
+            let angleDiff = targetAngle - currentAngle;
+            
+            // Normalize angle difference to [-PI, PI]
+            while (angleDiff > Math.PI) angleDiff -= 2 * Math.PI;
+            while (angleDiff < -Math.PI) angleDiff += 2 * Math.PI;
+            
+            // Smooth rotation using lerp on the normalized difference
+            localPlayer.rotation.y = currentAngle + angleDiff * 0.15;
+        }
     }
 
     // Head should not rotate with camera - keep it fixed
@@ -3881,6 +4470,7 @@ function updateCamera() {
     const horizontalDistance = cameraDistance * Math.cos(cameraPitch);
     const verticalOffset = cameraHeight + cameraDistance * Math.sin(cameraPitch);
     
+    // Base camera offset
     const cameraOffset = new THREE.Vector3(
         Math.sin(cameraAngle) * horizontalDistance,
         verticalOffset,
