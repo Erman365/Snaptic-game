@@ -7,6 +7,7 @@ let otherPlayers = new Map();
 let socket = null;
 let blocks = new Map();
 let selectedBlockType = 'dirt';
+let blocksInventoryOpen = true; // Block inventory (building menu) visibility
 let buildMode = 'build'; // 'build', 'delete', or null (nothing mode for items)
 let moveState = { forward: false, backward: false, left: false, right: false, jump: false, sprint: false };
 let velocity = new THREE.Vector3();
@@ -45,16 +46,34 @@ const cameraHeight = 4;
 let cameraAngle = 0;
 let cameraPitch = 0.3;
 let cameraLocked = false; // Camera lock state
+// Camera collision helpers
+const CAMERA_COLLISION_PADDING = 0.3; // How far from obstacles the camera should stay
+const cameraRaycaster = new THREE.Raycaster();
 let pauseMenuOpen = false; // Pause menu state (UI only, game continues running)
 let masterVolume = 1.0; // Master volume (0.0 to 1.0)
 
+// Interactive block tracking
+let nearbyInteractiveBlock = null; // Currently nearby door or sign
+let signInputOpen = false; // Whether sign input field is open
+let blockDamageCooldowns = new Map(); // Cooldown for damage blocks (blockKey -> timestamp)
+const DAMAGE_BLOCK_COOLDOWN = 1000; // 1 second cooldown between damage
+let killBlockCooldowns = new Map(); // Cooldown for kill blocks (blockKey -> timestamp)
+const KILL_BLOCK_COOLDOWN = 2000; // 2 second cooldown between kills
+let isDeathAnimationPlaying = false; // Track if death animation is currently playing
+
 // Block types with colors
 const BLOCK_TYPES = {
-    grass: { color: 0x4a7c59, name: 'Grass' },
-    stone: { color: 0x808080, name: 'Stone' },
-    wood: { color: 0x8b4513, name: 'Wood' },
-    brick: { color: 0xb22222, name: 'Brick' },
-    dirt: { color: 0x8b7355, name: 'Dirt' }
+    grass:  { color: 0x4a7c59, name: 'Grass' },
+    stone:  { color: 0x808080, name: 'Stone' },
+    wood:   { color: 0x8b4513, name: 'Wood' },
+    brick:  { color: 0xb22222, name: 'Brick' },
+    dirt:   { color: 0x8b7355, name: 'Dirt' },
+    // Special blocks
+    kill:   { color: 0xff0000, name: 'Kill Block' },        // Instantly kills on touch
+    damage: { color: 0xff8800, name: 'Damage Block' },      // Deals 25 damage on touch
+    door:   { color: 0x654321, name: 'Door' },              // Can be opened/closed with E
+    sign:   { color: 0xffff66, name: 'Sign' },              // Shows message when near
+    ladder: { color: 0xc2a17a, name: 'Ladder' }             // Allows climbing
 };
 
 // Initialize game
@@ -685,11 +704,24 @@ function createBlock(x, y, z, type = 'dirt') {
 function setupControls() {
     // Keyboard controls
     document.addEventListener('keydown', (e) => {
+        // Don't process game controls if player is dead (except ESC for pause menu)
+        // Check this FIRST, just like the input field check
+        if (playerHealth <= 0 && e.code !== 'Escape') {
+            moveState.forward = false;
+            moveState.backward = false;
+            moveState.left = false;
+            moveState.right = false;
+            moveState.sprint = false;
+            return; // Let nothing happen when dead
+        }
+        
         // Don't process game controls if user is typing in chat or name input
         const chatInput = document.getElementById('chat-input');
         const nameInput = document.getElementById('player-name');
+        const signInput = document.getElementById('sign-input');
         if ((chatInput && chatInput === document.activeElement) || 
-            (nameInput && nameInput === document.activeElement)) {
+            (nameInput && nameInput === document.activeElement) ||
+            (signInput && signInput === document.activeElement)) {
             return; // Let the input handle the key
         }
         
@@ -719,8 +751,8 @@ function setupControls() {
                 e.preventDefault();
                 break;
             case 'KeyQ':
-                // Don't process if typing in chat or name input
-                if (document.activeElement && (document.activeElement.id === 'chat-input' || document.activeElement.id === 'name-input')) {
+                // Don't process if typing in chat, name input, or sign input
+                if (document.activeElement && (document.activeElement.id === 'chat-input' || document.activeElement.id === 'name-input' || document.activeElement.id === 'sign-input')) {
                     return;
                 }
                 e.preventDefault(); // Always prevent default for Q
@@ -765,9 +797,23 @@ function setupControls() {
                     updateBuildModeUI();
                 }
                 break;
+            case 'KeyR':
+                // Don't process if typing in chat, name input, or sign input
+                if (document.activeElement && (document.activeElement.id === 'chat-input' || document.activeElement.id === 'name-input' || document.activeElement.id === 'sign-input')) {
+                    return;
+                }
+                // Toggle block inventory (building menu) visibility
+                (function() {
+                    const menu = document.getElementById('building-menu');
+                    if (!menu) return;
+                    blocksInventoryOpen = !blocksInventoryOpen;
+                    menu.style.display = blocksInventoryOpen ? 'flex' : 'none';
+                })();
+                e.preventDefault();
+                break;
             case 'KeyE':
                 // Don't process if typing in chat or name input
-                if (document.activeElement && (document.activeElement.id === 'chat-input' || document.activeElement.id === 'name-input')) {
+                if (document.activeElement && (document.activeElement.id === 'chat-input' || document.activeElement.id === 'name-input' || document.activeElement.id === 'sign-input')) {
                     return;
                 }
                 
@@ -788,11 +834,54 @@ function setupControls() {
                     updateInventoryUI();
                     return; // Exit early to prevent any other processing
                 }
-                // E key does nothing outside inventory (only cycles items in inventory)
+                
+                // Interact with nearby door or sign
+                if (nearbyInteractiveBlock) {
+                    e.preventDefault();
+                    const block = nearbyInteractiveBlock.block;
+                    const blockType = block.userData.type;
+                    
+                    if (blockType === 'door') {
+                        // Toggle door and all adjacent door blocks
+                        const blockKey = nearbyInteractiveBlock.key;
+                        const [x, y, z] = blockKey.split(',').map(Number);
+                        const isOpen = block.userData.isOpen || false;
+                        const newState = !isOpen;
+                        
+                        // Find all connected door blocks (adjacent in X, Y, or Z)
+                        const doorBlocks = findConnectedDoorBlocks(x, y, z, new Set());
+                        
+                        // Toggle all connected doors
+                        doorBlocks.forEach(({ block: doorBlock, key: doorKey }) => {
+                            doorBlock.userData.isOpen = newState;
+                            
+                            // Update material properties
+                            if (newState) {
+                                // Open door: make semi-transparent
+                                doorBlock.material.opacity = 0.3;
+                                doorBlock.material.transparent = true;
+                            } else {
+                                // Close door: restore opacity and collision
+                                doorBlock.material.opacity = 1.0;
+                                doorBlock.material.transparent = false;
+                            }
+                            doorBlock.material.needsUpdate = true;
+                            
+                            // Sync door state to server
+                            if (socket) {
+                                const [dx, dy, dz] = doorKey.split(',').map(Number);
+                                socket.emit('blockUpdate', { x: dx, y: dy, z: dz, type: 'door', isOpen: newState });
+                            }
+                        });
+                    } else if (blockType === 'sign') {
+                        // Open sign input field
+                        openSignInput(block);
+                    }
+                }
                 break;
             case 'KeyF':
-                // Don't process if typing in chat or name input
-                if (document.activeElement && (document.activeElement.id === 'chat-input' || document.activeElement.id === 'name-input')) {
+                // Don't process if typing in chat, name input, or sign input
+                if (document.activeElement && (document.activeElement.id === 'chat-input' || document.activeElement.id === 'name-input' || document.activeElement.id === 'sign-input')) {
                     return;
                 }
                 // Toggle inventory
@@ -848,6 +937,17 @@ function setupControls() {
     });
 
     document.addEventListener('keyup', (e) => {
+        // Don't process game controls if player is dead
+        // Check this FIRST, just like the input field check
+        if (playerHealth <= 0) {
+            moveState.forward = false;
+            moveState.backward = false;
+            moveState.left = false;
+            moveState.right = false;
+            moveState.sprint = false;
+            return; // Let nothing happen when dead
+        }
+        
         switch(e.code) {
             case 'KeyW':
             case 'ArrowUp':
@@ -908,6 +1008,11 @@ function setupControls() {
     
     // Mouse movement - track continuously when camera is locked
     document.addEventListener('mousemove', (e) => {
+        // Disable camera movement when dead - check FIRST
+        if (playerHealth <= 0) {
+            return;
+        }
+        
         if (cameraLocked) {
             // When locked, use movementX/Y from pointer lock (cursor is locked to center)
             const deltaX = e.movementX || 0;
@@ -928,6 +1033,9 @@ function setupControls() {
     });
     
     document.addEventListener('mousedown', (e) => {
+        // Disable mouse inputs when dead
+        if (playerHealth <= 0) return;
+        
         if (e.target.id === 'game-canvas') {
             // Only handle camera movement on right click (when not locked)
             if (e.button === 2 && !cameraLocked) {
@@ -966,6 +1074,12 @@ function setupControls() {
 
     // Mouse click for building (no pointer lock required)
     document.addEventListener('mousedown', (e) => {
+        // Disable ALL mouse inputs when dead - check FIRST
+        if (playerHealth <= 0) {
+            e.preventDefault();
+            return;
+        }
+        
         // Only handle clicks on the canvas
         if (e.target.id !== 'game-canvas') return;
         
@@ -987,6 +1101,9 @@ function setupControls() {
 
         // Handle item usage or building/deleting based on mode (only left click)
         if (e.button === 0) {
+            // Don't allow actions when dead
+            if (playerHealth <= 0) return;
+            
             // If inventory is open, use item
             if (inventoryOpen) {
                 useItem(localPlayer);
@@ -1061,15 +1178,16 @@ function setupControls() {
                 const block = intersect.object;
                 // Only remove if it's a block, not the ground
                 if (block.userData.type) {
-                        swingArm(localPlayer);
-                        // Notify other players of arm swing
-                        if (socket) {
-                            socket.emit('playerSwingArm');
-                        }
-                    const pos = block.position;
-                        const gridY = block.userData.gridY !== undefined ? block.userData.gridY : Math.round(pos.y - 0.5);
-                        removeBlock(Math.round(pos.x), gridY, Math.round(pos.z));
+                    swingArm(localPlayer);
+                    // Notify other players of arm swing
+                    if (socket) {
+                        socket.emit('playerSwingArm');
                     }
+                    const pos = block.position;
+                    const gridY = block.userData.gridY !== undefined ? block.userData.gridY : Math.round(pos.y - 0.5);
+                    // Delete block locally AND notify server so other players see it
+                    deleteBlockAt(Math.round(pos.x), gridY, Math.round(pos.z));
+                }
                 }
             }
         }
@@ -1128,9 +1246,16 @@ function setupChat() {
         // Stop event propagation so game controls don't interfere
         e.stopPropagation();
         
-        if (e.key === 'Enter' && chatInput.value.trim()) {
-            sendChatMessage(chatInput.value);
-            chatInput.value = '';
+        if (e.key === 'Enter') {
+            if (chatInput.value.trim()) {
+                sendChatMessage(chatInput.value);
+                chatInput.value = '';
+                // Deselect chat input after sending
+                chatInput.blur();
+            } else {
+                // If Enter pressed with empty chat, focus the input
+                chatInput.focus();
+            }
             // Stop typing indicator
             if (socket && isTyping) {
                 socket.emit('playerTyping', false);
@@ -1237,9 +1362,11 @@ function updateTypingBubblePosition(player) {
     head.getWorldPosition(headWorldPos);
     headWorldPos.y += 0.5; // Position above head
 
+    // Project to screen space using canvas rect to avoid wobble when rotating camera
     const screenPos = headWorldPos.project(camera);
-    const x = (screenPos.x * 0.5 + 0.5) * window.innerWidth;
-    const y = (-screenPos.y * 0.5 + 0.5) * window.innerHeight;
+    const rect = renderer.domElement.getBoundingClientRect();
+    const x = rect.left + (screenPos.x * 0.5 + 0.5) * rect.width;
+    const y = rect.top + (-screenPos.y * 0.5 + 0.5) * rect.height;
 
     player.userData.typingBubble.style.left = x + 'px';
     player.userData.typingBubble.style.top = (y - 40) + 'px';
@@ -1289,9 +1416,10 @@ function updateSpeechBubblePosition(player) {
     head.getWorldPosition(headWorldPos);
     headWorldPos.y += 0.8;
 
-    const vector = headWorldPos.project(camera);
-    const x = (vector.x * 0.5 + 0.5) * window.innerWidth;
-    const y = (vector.y * -0.5 + 0.5) * window.innerHeight;
+    // Project head position directly to screen space so bubble stays locked above head
+    const v = headWorldPos.project(camera);
+    const x = Math.round((v.x * 0.5 + 0.5) * window.innerWidth);
+    const y = Math.round((-v.y * 0.5 + 0.5) * window.innerHeight);
 
     player.userData.speechBubble.style.left = x + 'px';
     player.userData.speechBubble.style.top = y + 'px';
@@ -1325,9 +1453,10 @@ function updateNameLabelPosition(player) {
     // Position name label lower than speech bubble to avoid collision
     headWorldPos.y += 0.3; // Lower than speech bubble (which is at 0.8)
 
-    const vector = headWorldPos.project(camera);
-    const x = (vector.x * 0.5 + 0.5) * window.innerWidth;
-    const y = (vector.y * -0.5 + 0.5) * window.innerHeight;
+    // Project head position directly to screen space so label stays locked above head
+    const v = headWorldPos.project(camera);
+    const x = Math.round((v.x * 0.5 + 0.5) * window.innerWidth);
+    const y = Math.round((-v.y * 0.5 + 0.5) * window.innerHeight);
 
     player.userData.nameLabel.style.left = x + 'px';
     player.userData.nameLabel.style.top = y + 'px';
@@ -1585,9 +1714,12 @@ function checkCollisionWithBlocks(player, worldPos, radius, returnHitInfo = fals
                 
                 // Push player away
                 if (player === localPlayer) {
-                    localPlayer.position.x += pushDir.x * pushAmount;
-                    localPlayer.position.y += pushDir.y * pushAmount;
-                    localPlayer.position.z += pushDir.z * pushAmount;
+                    // Only push if not dead
+                    if (playerHealth > 0) {
+                        localPlayer.position.x += pushDir.x * pushAmount;
+                        localPlayer.position.y += pushDir.y * pushAmount;
+                        localPlayer.position.z += pushDir.z * pushAmount;
+                    }
                 } else {
                     player.position.x += pushDir.x * pushAmount;
                     player.position.y += pushDir.y * pushAmount;
@@ -1614,8 +1746,8 @@ function checkCollisionWithBlocks(player, worldPos, radius, returnHitInfo = fals
         const pushAmount = Math.min(0.08, penetration * 0.5);
         
         if (player === localPlayer) {
-            // Only push if significantly below ground to prevent constant jitter
-            if (penetration > 0.05) {
+            // Only push if significantly below ground to prevent constant jitter (and not dead)
+            if (penetration > 0.05 && playerHealth > 0) {
                 localPlayer.position.y += pushAmount;
             }
             // Dampen velocity more smoothly
@@ -2150,9 +2282,7 @@ function animateStickman(player, delta) {
         // Elbow bend - forearm rotates relative to upper arm (increased swing)
         // Move forearm back slightly to align joints
         if (player.userData.leftForearm) {
-            player.userData.leftForearm.rotation.x = Math.abs(-armSwing) * 0.6; // Increased elbow bend when swinging
-            // Move forearm back to align joints
-            player.userData.leftForearm.position.z = -0.02; // Small backward offset to align joints
+            player.userData.leftForearm.rotation.x = Math.abs(armSwing) * 0.3; // Elbow bend when swinging
         }
     }
     
@@ -2236,18 +2366,18 @@ function updateBuildModeUI() {
         if (buildMode === 'build') {
             instructions.innerHTML = `
                 <p><strong>WASD</strong> - Move | <strong>Shift</strong> - Sprint | <strong>Space</strong> - Jump | <strong>Right Click + Drag</strong> - Look around</p>
-                <p><strong>Q</strong> - Cycle Mode | <strong>F</strong> - Inventory | <strong>Left Click</strong> - Place block | <strong>Mode: BUILD</strong></p>
+                <p><strong>Q</strong> - Cycle Mode | <strong>R</strong> - Block Inventory | <strong>F</strong> - Item Inventory | <strong>Left Click</strong> - Place block | <strong>Mode: BUILD</strong></p>
             `;
         } else if (buildMode === 'delete') {
             instructions.innerHTML = `
                 <p><strong>WASD</strong> - Move | <strong>Shift</strong> - Sprint | <strong>Space</strong> - Jump | <strong>Right Click + Drag</strong> - Look around</p>
-                <p><strong>Q</strong> - Cycle Mode | <strong>F</strong> - Inventory | <strong>Left Click</strong> - Delete block | <strong>Mode: DELETE</strong></p>
+                <p><strong>Q</strong> - Cycle Mode | <strong>R</strong> - Block Inventory | <strong>F</strong> - Item Inventory | <strong>Left Click</strong> - Delete block | <strong>Mode: DELETE</strong></p>
             `;
         } else {
             const itemName = localPlayer && localPlayer.userData.equippedItem ? localPlayer.userData.equippedItem : 'None';
             instructions.innerHTML = `
                 <p><strong>WASD</strong> - Move | <strong>Shift</strong> - Sprint | <strong>Space</strong> - Jump | <strong>Right Click + Drag</strong> - Look around</p>
-                <p><strong>Q</strong> - Cycle Mode | <strong>F</strong> - Inventory | <strong>Left Click</strong> - Use ${itemName} | <strong>Mode: ITEM</strong></p>
+                <p><strong>Q</strong> - Cycle Mode | <strong>R</strong> - Block Inventory | <strong>F</strong> - Item Inventory | <strong>Left Click</strong> - Use ${itemName} | <strong>Mode: ITEM</strong></p>
             `;
         }
     }
@@ -2871,6 +3001,9 @@ function updateInventoryUI() {
 function useItem(player) {
     if (!player || isUsingItem) return;
     
+    // Don't allow item use when dead
+    if (playerHealth <= 0) return;
+    
     const item = inventory[selectedInventoryIndex];
     if (!item) return;
     
@@ -2880,6 +3013,10 @@ function useItem(player) {
     if (item === 'sword') {
         // Sword attack - swing animation and damage
         swingSword(player);
+        // Notify other players of sword swing
+        if (player === localPlayer && socket) {
+            socket.emit('playerUseItemSwing', { item: 'sword' });
+        }
         // Check for nearby players to damage (with slight delay to hit during swing)
         setTimeout(() => {
             checkSwordHit(player);
@@ -2887,6 +3024,10 @@ function useItem(player) {
     } else if (item === 'baseballbat') {
         // Baseball bat attack - swing animation and ragdoll launch
         swingSword(player); // Reuse sword swing animation
+        // Notify other players of bat swing
+        if (player === localPlayer && socket) {
+            socket.emit('playerUseItemSwing', { item: 'baseballbat' });
+        }
         // Check for nearby players to hit (with slight delay to hit during swing)
         setTimeout(() => {
             checkBatHit(player);
@@ -3213,8 +3354,8 @@ function updatePlayerHealthBar(player) {
     headWorldPos.y += 1.0;
     
     const vector = headWorldPos.project(camera);
-    const x = (vector.x * 0.5 + 0.5) * window.innerWidth;
-    const y = (vector.y * -0.5 + 0.5) * window.innerHeight;
+    const x = Math.round((vector.x * 0.5 + 0.5) * window.innerWidth);
+    const y = Math.round((vector.y * -0.5 + 0.5) * window.innerHeight);
     
     player.userData.healthBar.style.left = x + 'px';
     player.userData.healthBar.style.top = y + 'px';
@@ -3813,11 +3954,51 @@ function returnToMenu() {
     
     // Clean up game state
     if (localPlayer) {
+        // Remove local player's UI elements
+        if (localPlayer.userData.speechBubble && localPlayer.userData.speechBubble.parentNode) {
+            localPlayer.userData.speechBubble.parentNode.removeChild(localPlayer.userData.speechBubble);
+        }
+        if (localPlayer.userData.nameLabel && localPlayer.userData.nameLabel.parentNode) {
+            localPlayer.userData.nameLabel.parentNode.removeChild(localPlayer.userData.nameLabel);
+        }
+        if (localPlayer.userData.healthBar && localPlayer.userData.healthBar.parentNode) {
+            localPlayer.userData.healthBar.parentNode.removeChild(localPlayer.userData.healthBar);
+        }
         scene.remove(localPlayer);
         localPlayer = null;
     }
+    
+    // Remove other players and their UI elements
+    otherPlayers.forEach((player) => {
+        scene.remove(player);
+        if (player.userData.speechBubble && player.userData.speechBubble.parentNode) {
+            player.userData.speechBubble.parentNode.removeChild(player.userData.speechBubble);
+        }
+        if (player.userData.nameLabel && player.userData.nameLabel.parentNode) {
+            player.userData.nameLabel.parentNode.removeChild(player.userData.nameLabel);
+        }
+        if (player.userData.healthBar && player.userData.healthBar.parentNode) {
+            player.userData.healthBar.parentNode.removeChild(player.userData.healthBar);
+        }
+        if (player.userData.typingBubble && player.userData.typingBubble.parentNode) {
+            player.userData.typingBubble.parentNode.removeChild(player.userData.typingBubble);
+        }
+    });
     otherPlayers.clear();
+    
+    // Remove all blocks from the scene
+    blocks.forEach((block) => {
+        scene.remove(block);
+    });
     blocks.clear();
+    
+    // Remove local health bar UI if present
+    const localHealthBar = document.getElementById('local-health-bar');
+    if (localHealthBar && localHealthBar.parentNode) {
+        localHealthBar.parentNode.removeChild(localHealthBar);
+    }
+    
+    // Reset health
     playerHealth = maxHealth;
 }
 
@@ -3830,7 +4011,8 @@ function killPlayer() {
     if (socket) {
         socket.emit('playerDamage', {
             targetId: socket.id,
-            damage: 1000 // Massive damage to ensure death
+            damage: 1000, // Massive damage to ensure death
+            allowSelf: true // Allow self-damage on server for reset
         });
     }
 }
@@ -3894,6 +4076,13 @@ function connectToServer() {
             if (player.userData.nameLabel) {
                 document.body.removeChild(player.userData.nameLabel);
             }
+            // Remove health bar if present
+            if (player.userData.healthBar) {
+                if (player.userData.healthBar.parentNode) {
+                    player.userData.healthBar.parentNode.removeChild(player.userData.healthBar);
+                }
+                player.userData.healthBar = null;
+            }
             otherPlayers.delete(playerId);
             updatePlayerCount();
         }
@@ -3909,6 +4098,25 @@ function connectToServer() {
 
     socket.on('blockRemoved', (data) => {
         removeBlock(data.x, data.y, data.z);
+    });
+    
+    socket.on('blockUpdated', (data) => {
+        const blockKey = `${data.x},${data.y},${data.z}`;
+        const block = blocks.get(blockKey);
+        if (block) {
+            if (data.type === 'door') {
+                block.userData.isOpen = data.isOpen || false;
+                if (block.userData.isOpen) {
+                    block.material.opacity = 0.3;
+                    block.material.transparent = true;
+                } else {
+                    block.material.opacity = 1.0;
+                    block.material.transparent = false;
+                }
+            } else if (data.type === 'sign') {
+                block.userData.message = data.message || '';
+            }
+        }
     });
 
     socket.on('playerDamaged', (data) => {
@@ -3940,7 +4148,15 @@ function connectToServer() {
             velocity: new THREE.Vector3(cube.velocity.x, cube.velocity.y, cube.velocity.z)
         })) : null;
         
-        createDeathExplosion(deathPos, cubeData);
+        // Only create death explosion if not already playing
+        if (!isDeathAnimationPlaying) {
+            isDeathAnimationPlaying = true;
+            createDeathExplosion(deathPos, cubeData);
+            // Reset flag after animation completes
+            setTimeout(() => {
+                isDeathAnimationPlaying = false;
+            }, 3000); // 3 seconds
+        }
         
         if (data.playerId === socket.id) {
             // Local player died
@@ -4002,6 +4218,15 @@ function connectToServer() {
         if (player) {
             player.userData.equippedItem = data.item;
             createItemInHand(player, data.item);
+        }
+    });
+
+    // Handle other player item swing (sword / baseball bat)
+    socket.on('playerUseItemSwing', (data) => {
+        const player = otherPlayers.get(data.playerId);
+        if (player) {
+            // Play the same swing animation on the other player
+            swingSword(player);
         }
     });
 
@@ -4128,12 +4353,58 @@ function placeBlock(x, y, z, type) {
     addBlock(x, y, z, type);
 }
 
+// Delete block locally and notify server
+function deleteBlockAt(x, y, z) {
+    if (socket) {
+        socket.emit('removeBlock', { x, y, z });
+    }
+    removeBlock(x, y, z);
+}
+
+// Find all connected door blocks (adjacent in X, Y, or Z)
+function findConnectedDoorBlocks(x, y, z, visited) {
+    const key = `${x},${y},${z}`;
+    if (visited.has(key)) return [];
+    
+    const block = blocks.get(key);
+    if (!block || block.userData.type !== 'door') return [];
+    
+    visited.add(key);
+    const result = [{ block, key }];
+    
+    // Check all 6 adjacent positions (up, down, north, south, east, west)
+    const directions = [
+        [0, 1, 0], [0, -1, 0],  // Up, Down
+        [0, 0, 1], [0, 0, -1],  // North, South
+        [1, 0, 0], [-1, 0, 0]   // East, West
+    ];
+    
+    for (const [dx, dy, dz] of directions) {
+        const adjKey = `${x + dx},${y + dy},${z + dz}`;
+        if (!visited.has(adjKey) && blocks.has(adjKey)) {
+            const adjBlock = blocks.get(adjKey);
+            if (adjBlock && adjBlock.userData.type === 'door') {
+                result.push(...findConnectedDoorBlocks(x + dx, y + dy, z + dz, visited));
+            }
+        }
+    }
+    
+    return result;
+}
+
 function addBlock(x, y, z, type) {
     const blockKey = `${x},${y},${z}`;
     if (!blocks.has(blockKey)) {
         const block = createBlock(x, y, z, type);
         scene.add(block);
         blocks.set(blockKey, block);
+        
+        // Initialize block state
+        if (type === 'door') {
+            block.userData.isOpen = false;
+        } else if (type === 'sign') {
+            block.userData.message = '';
+        }
     }
 }
 
@@ -4149,49 +4420,125 @@ function removeBlock(x, y, z) {
 // Update player movement
 function updatePlayerMovement(delta) {
     if (!localPlayer) return;
+    
+    // Disable movement and actions if player is dead
+    // Check this FIRST before anything else
+    if (playerHealth <= 0) {
+        // Stop all movement immediately
+        velocity.x = 0;
+        velocity.z = 0;
+        velocity.y = 0;
+        // Reset all movement states
+        moveState.forward = false;
+        moveState.backward = false;
+        moveState.left = false;
+        moveState.right = false;
+        moveState.sprint = false;
+        // Don't update position when dead
+        return; // Don't process movement when dead
+    }
 
     // Store intended movement direction for rotation (before collisions modify velocity)
     let intendedDirection = null;
 
-    // Skip movement controls if ragdoll is active, but still apply physics and collision
-    if (!isRagdoll) {
+    // Skip movement controls if ragdoll is active or dead, but still apply physics and collision
+    if (!isRagdoll && playerHealth > 0) {
         // Base speed increased by 30% (100 * 1.3 = 130)
         const baseSpeed = 130;
         // Sprint doubles speed (130 * 2.0 = 260)
         const speed = moveState.sprint ? baseSpeed * 2.0 : baseSpeed;
-    const direction = new THREE.Vector3();
+        const direction = new THREE.Vector3();
 
-    // Calculate movement direction based on camera angle
-    if (moveState.forward) direction.z -= 1;
-    if (moveState.backward) direction.z += 1;
-    if (moveState.left) direction.x -= 1;
-    if (moveState.right) direction.x += 1;
+        // Calculate movement direction based on camera angle
+        // Only use moveState if player is alive
+        if (moveState.forward) direction.z -= 1;
+        if (moveState.backward) direction.z += 1;
+        if (moveState.left) direction.x -= 1;
+        if (moveState.right) direction.x += 1;
 
-    direction.normalize();
-    direction.applyAxisAngle(new THREE.Vector3(0, 1, 0), cameraAngle);
+        direction.normalize();
+        direction.applyAxisAngle(new THREE.Vector3(0, 1, 0), cameraAngle);
 
-    // Store intended movement direction for rotation (before collisions modify velocity)
-    intendedDirection = direction.clone();
+        // Store intended movement direction for rotation (before collisions modify velocity)
+        intendedDirection = direction.clone();
 
-    // Apply movement
-    velocity.x = direction.x * speed * delta;
-    velocity.z = direction.z * speed * delta;
-
-        // Apply gravity when not in ragdoll (ragdoll handles its own gravity)
-    velocity.y -= 30 * delta; // Gravity
+        // Apply movement
+        velocity.x = direction.x * speed * delta;
+        velocity.z = direction.z * speed * delta;
+    } else if (playerHealth <= 0) {
+        // Ensure velocity is zero when dead (in case we got here somehow)
+        velocity.x = 0;
+        velocity.z = 0;
+        velocity.y = 0;
     }
-    // Note: Gravity during ragdoll is handled in updateRagdoll function
+    // Note: Gravity is applied after checking for ladders (see below)
 
     // Store old position for collision detection
     const oldPos = localPlayer.position.clone();
     
     // Track when player leaves ground for fall detection
     const wasOnGround = localPlayer.position.y <= lastGroundY + 0.5;
+    
+    // Check for ladders - Minecraft-style: climb up only when holding W, descend slowly when not
+    // Ladder detection area is one block larger on each side horizontally, but only one block tall vertically
+    let onLadder = false;
+    const ladderCheckRadius = 0.25;
+    const playerFeetY = localPlayer.position.y - 0.3; // Feet position
+    const playerHeadY = localPlayer.position.y + 1.35; // Head position
+    
+    for (const [key, block] of blocks.entries()) {
+        if (block.userData.type === 'ladder') {
+            const blockPos = block.position;
+            const gridY = block.userData.gridY !== undefined ? block.userData.gridY : Math.round(blockPos.y - 0.5);
+            // Expand detection area by one block on each side horizontally (3x3 area), but keep Y limited to block height
+            const blockMin = new THREE.Vector3(blockPos.x - 1.5, gridY, blockPos.z - 1.5);
+            const blockMax = new THREE.Vector3(blockPos.x + 1.5, gridY + 1, blockPos.z + 1.5);
+            
+            // Check horizontal overlap (X and Z)
+            const horizontalOverlap = (localPlayer.position.x + ladderCheckRadius > blockMin.x &&
+                localPlayer.position.x - ladderCheckRadius < blockMax.x &&
+                localPlayer.position.z + ladderCheckRadius > blockMin.z &&
+                localPlayer.position.z - ladderCheckRadius < blockMax.z);
+            
+            // Check vertical overlap (Y) - player must be within the ladder block's Y range
+            const verticalOverlap = (playerFeetY < blockMax.y && playerHeadY > blockMin.y);
+            
+            if (horizontalOverlap && verticalOverlap) {
+                onLadder = true;
+                // Only climb up when holding W (forward)
+                if (moveState.forward && !isRagdoll) {
+                    // Move player up while holding W
+                    velocity.y = Math.max(velocity.y, 5.0); // Upward velocity
+                }
+                break;
+            }
+        }
+    }
+    
+    // Apply gravity (only if not dead)
+    if (!isRagdoll && playerHealth > 0) {
+        if (onLadder) {
+            // On ladder: slow descent when not holding W
+            if (!moveState.forward) {
+                velocity.y -= 5 * delta; // Slow gravity (much slower than normal)
+            }
+        } else {
+            // Not on ladder: normal gravity
+            velocity.y -= 30 * delta; // Normal gravity
+        }
+    } else if (playerHealth <= 0) {
+        // Ensure velocity is zero when dead
+        velocity.y = 0;
+    }
 
-    // Update position
-    localPlayer.position.x += velocity.x * delta;
-    localPlayer.position.z += velocity.z * delta;
-    localPlayer.position.y += velocity.y * delta;
+    // Update position (only if not dead)
+    // This should never execute if dead due to early return above, but add safety check
+    if (playerHealth > 0) {
+        localPlayer.position.x += velocity.x * delta;
+        localPlayer.position.z += velocity.z * delta;
+        localPlayer.position.y += velocity.y * delta;
+    }
+    // If dead, we returned early, so this code should never execute
 
     // If player was on ground and is now falling, store the ground Y
     if (wasOnGround && velocity.y < 0 && !isRagdoll) {
@@ -4210,7 +4557,9 @@ function updatePlayerMovement(delta) {
     
     // Check collisions with blocks
     let onGround = false;
+    // Note: onLadder is already checked before gravity application
     for (const [key, block] of blocks.entries()) {
+        const blockType = block.userData.type;
         const blockPos = block.position;
         // Block center is at y + 0.5 (since we add 0.5 in createBlock), so it extends from y to y + 1
         const gridY = block.userData.gridY !== undefined ? block.userData.gridY : Math.round(blockPos.y - 0.5);
@@ -4223,7 +4572,59 @@ function updatePlayerMovement(delta) {
             localPlayer.position.z + playerRadius > blockMin.z &&
             localPlayer.position.z - playerRadius < blockMax.z);
         
+        // Handle special blocks
         if (horizontalOverlap) {
+            // Kill block - instant death (with cooldown to prevent repeated deaths)
+            if (blockType === 'kill') {
+                // Only trigger if player is alive and not already in death animation
+                if (playerHealth > 0 && !isDeathAnimationPlaying) {
+                    const now = Date.now();
+                    const lastKill = killBlockCooldowns.get(key) || 0;
+                    if (now - lastKill >= KILL_BLOCK_COOLDOWN) {
+                        killBlockCooldowns.set(key, now);
+                        // Don't set isDeathAnimationPlaying here - let playerDied event set it
+                        if (socket) {
+                            socket.emit('playerDamage', {
+                                targetId: socket.id,
+                                damage: 1000,
+                                allowSelf: true
+                            });
+                        }
+                    }
+                }
+                // Don't skip collision - kill blocks should have collisions
+            }
+            
+            // Damage block - deal 25 damage with cooldown
+            if (blockType === 'damage') {
+                // Only trigger if player is alive
+                if (playerHealth > 0) {
+                    const now = Date.now();
+                    const lastDamage = blockDamageCooldowns.get(key) || 0;
+                    if (now - lastDamage >= DAMAGE_BLOCK_COOLDOWN) {
+                        blockDamageCooldowns.set(key, now);
+                        if (socket) {
+                            socket.emit('playerDamage', {
+                                targetId: socket.id,
+                                damage: 25,
+                                allowSelf: true
+                            });
+                        }
+                    }
+                }
+                // Don't skip collision - damage blocks should have collisions
+            }
+            
+            // Door - skip collision if open
+            if (blockType === 'door' && block.userData.isOpen) {
+                continue; // Skip collision for open doors
+            }
+            
+            // Ladder - apply normal collision (player can't pass through)
+            // Ladder movement is handled before gravity application
+            // (don't skip - ladders should have collisions like normal blocks)
+            
+            // Normal collision detection for other blocks
             // Check if player is on top of block (landing/jumping onto)
             const blockTop = blockMax.y;
             const feetY = localPlayer.position.y - 0.3; // Feet position
@@ -4252,17 +4653,23 @@ function updatePlayerMovement(delta) {
                         }
                     }
                     
-                    localPlayer.position.y = blockTop + 0.27; // Player center = block top + 0.27 (feet on block, lowered by 0.03)
-                    velocity.y = 0;
-                    canJump = true;
-                    onGround = true;
-                    lastGroundY = blockTop + 0.27; // Update last ground Y when landing
+                    // Only update position if not dead
+                    if (playerHealth > 0) {
+                        localPlayer.position.y = blockTop + 0.27; // Player center = block top + 0.27 (feet on block, lowered by 0.03)
+                        velocity.y = 0;
+                        canJump = true;
+                        onGround = true;
+                        lastGroundY = blockTop + 0.27; // Update last ground Y when landing
+                    }
                 }
             }
             // Hitting ceiling of block
             else if (headY >= blockMin.y - 0.1 && headY <= blockMin.y + 0.3 && velocity.y > 0) {
-                localPlayer.position.y = blockMin.y - 1.35; // Player center = block bottom - 1.35
-                velocity.y = 0;
+                // Only update position if not dead
+                if (playerHealth > 0) {
+                    localPlayer.position.y = blockMin.y - 1.35; // Player center = block bottom - 1.35
+                    velocity.y = 0;
+                }
             }
             // Side collision - push player away horizontally using proper AABB (rectangular) collision
             else if (headY > blockMin.y && feetY < blockMax.y) {
@@ -4303,9 +4710,11 @@ function updatePlayerMovement(delta) {
                         }
                     }
                     
-                    // Apply the push
-                    localPlayer.position.x += pushX;
-                    localPlayer.position.z += pushZ;
+                    // Apply the push (only if not dead)
+                    if (playerHealth > 0) {
+                        localPlayer.position.x += pushX;
+                        localPlayer.position.z += pushZ;
+                    }
                     
                     // Calculate wall normal based on push direction
                     const pushLength = Math.sqrt(pushX * pushX + pushZ * pushZ);
@@ -4350,8 +4759,11 @@ function updatePlayerMovement(delta) {
             }
         }
         
-        localPlayer.position.y = 0.27; // Feet on ground (y=0, center at 0.27 since bottom is center - 0.3, lowered by 0.03)
-        velocity.y = 0;
+        // Only update position if not dead
+        if (playerHealth > 0) {
+            localPlayer.position.y = 0.27; // Feet on ground (y=0, center at 0.27 since bottom is center - 0.3, lowered by 0.03)
+            velocity.y = 0;
+        }
         canJump = true;
         lastGroundY = 0.27; // Update last ground Y when landing
     } else if (onGround) {
@@ -4388,8 +4800,11 @@ function updatePlayerMovement(delta) {
             const overlap = minDistance - distance;
             const pushAmount = overlap * 0.5; // Push half the overlap distance
             
-            localPlayer.position.x += pushDirection.x * pushAmount;
-            localPlayer.position.z += pushDirection.z * pushAmount;
+            // Only push if not dead
+            if (playerHealth > 0) {
+                localPlayer.position.x += pushDirection.x * pushAmount;
+                localPlayer.position.z += pushDirection.z * pushAmount;
+            }
             
             // Reduce velocity when colliding (unless in ragdoll)
             if (!isRagdoll) {
@@ -4437,8 +4852,8 @@ function updatePlayerMovement(delta) {
     // Head should not rotate with camera - keep it fixed
     // (Removed head rotation that followed camera)
 
-    // Send position to server
-    if (socket && localPlayer) {
+    // Send position to server (only if not dead)
+    if (socket && localPlayer && playerHealth > 0) {
         socket.emit('playerMove', {
             position: {
                 x: localPlayer.position.x,
@@ -4470,20 +4885,312 @@ function updateCamera() {
     const horizontalDistance = cameraDistance * Math.cos(cameraPitch);
     const verticalOffset = cameraHeight + cameraDistance * Math.sin(cameraPitch);
     
-    // Base camera offset
+    // Base desired camera offset (behind player)
     const cameraOffset = new THREE.Vector3(
         Math.sin(cameraAngle) * horizontalDistance,
         verticalOffset,
         Math.cos(cameraAngle) * horizontalDistance
     );
 
-    const targetPos = playerPos.clone().add(cameraOffset);
-    camera.position.lerp(targetPos, 0.1);
+    // Desired camera position before collision
+    const desiredPos = playerPos.clone().add(cameraOffset);
+
+    // ==== CAMERA COLLISION WITH GROUND & BLOCKS ====
+    // Raycast from player toward desired camera position
+    const rayOrigin = playerPos.clone();
+    // Raise origin a bit to be closer to head height
+    rayOrigin.y += 1.0;
+    const rayDirection = desiredPos.clone().sub(rayOrigin);
+    const distance = rayDirection.length();
+    if (distance > 0.0001) {
+        rayDirection.normalize();
+
+        // Build list of collision objects: all blocks + ground (objects with userData.isGround)
+        const collisionObjects = [];
+        blocks.forEach(block => {
+            collisionObjects.push(block);
+        });
+        scene.children.forEach(obj => {
+            if (obj.userData && obj.userData.isGround) {
+                collisionObjects.push(obj);
+            }
+        });
+
+        cameraRaycaster.set(rayOrigin, rayDirection);
+        cameraRaycaster.far = distance;
+        const hits = cameraRaycaster.intersectObjects(collisionObjects, false);
+
+        let targetPos;
+        if (hits.length > 0) {
+            // Move camera to just in front of the first hit point
+            const hitPoint = hits[0].point.clone();
+            targetPos = hitPoint.add(rayDirection.clone().multiplyScalar(-CAMERA_COLLISION_PADDING));
+        } else {
+            targetPos = desiredPos;
+        }
+
+        // Prevent camera from going below ground
+        const minCameraY = 0.3; // Slightly above ground level
+        if (targetPos.y < minCameraY) {
+            targetPos.y = minCameraY;
+        }
+
+        camera.position.lerp(targetPos, 0.1);
+    }
 
     // Look at player (with slight height offset)
     const lookAtPos = playerPos.clone();
     lookAtPos.y += 1.5;
     camera.lookAt(lookAtPos);
+}
+
+// Check for nearby interactive blocks (doors, signs)
+function checkNearbyInteractiveBlocks() {
+    if (!localPlayer) {
+        nearbyInteractiveBlock = null;
+        updateEIndicator();
+        return;
+    }
+    
+    const playerPos = localPlayer.position;
+    const checkDistance = 2.0; // 2 block distance
+    
+    let closestBlock = null;
+    let closestDistance = Infinity;
+    
+    for (const [key, block] of blocks.entries()) {
+        const blockType = block.userData.type;
+        if (blockType !== 'door' && blockType !== 'sign') continue;
+        
+        const blockPos = block.position;
+        const distance = playerPos.distanceTo(blockPos);
+        
+        if (distance <= checkDistance && distance < closestDistance) {
+            closestDistance = distance;
+            closestBlock = { block, key };
+        }
+    }
+    
+    nearbyInteractiveBlock = closestBlock;
+    updateEIndicator();
+}
+
+// Update E indicator UI
+function updateEIndicator() {
+    let indicator = document.getElementById('e-indicator');
+    
+    if (nearbyInteractiveBlock && !signInputOpen) {
+        if (!indicator) {
+            indicator = document.createElement('div');
+            indicator.id = 'e-indicator';
+            indicator.style.cssText = `
+                position: fixed;
+                top: 50%;
+                left: 50%;
+                transform: translate(-50%, -50%);
+                background: rgba(0, 0, 0, 0.8);
+                color: #fff;
+                padding: 10px 20px;
+                border-radius: 8px;
+                font-size: 18px;
+                font-weight: bold;
+                z-index: 1000;
+                pointer-events: none;
+                border: 2px solid #4a9eff;
+            `;
+            indicator.textContent = 'Press E';
+            document.body.appendChild(indicator);
+        }
+        indicator.style.display = 'block';
+    } else {
+        if (indicator) {
+            indicator.style.display = 'none';
+        }
+    }
+}
+
+// Open sign input field
+function openSignInput(block) {
+    signInputOpen = true;
+    
+    // Create input container
+    let inputContainer = document.getElementById('sign-input-container');
+    if (!inputContainer) {
+        inputContainer = document.createElement('div');
+        inputContainer.id = 'sign-input-container';
+        inputContainer.style.cssText = `
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            background: rgba(0, 0, 0, 0.9);
+            padding: 20px;
+            border-radius: 10px;
+            z-index: 10001;
+            min-width: 300px;
+        `;
+        
+        const label = document.createElement('div');
+        label.textContent = 'Enter sign message:';
+        label.style.cssText = 'color: #fff; margin-bottom: 10px; font-size: 16px;';
+        inputContainer.appendChild(label);
+        
+        const input = document.createElement('input');
+        input.id = 'sign-input';
+        input.type = 'text';
+        input.placeholder = 'Type message here...';
+        input.style.cssText = `
+            width: 100%;
+            padding: 10px;
+            background: rgba(255, 255, 255, 0.1);
+            border: 2px solid #4a9eff;
+            border-radius: 5px;
+            color: #fff;
+            font-size: 14px;
+            outline: none;
+            box-sizing: border-box;
+        `;
+        inputContainer.appendChild(input);
+        
+        const buttonContainer = document.createElement('div');
+        buttonContainer.style.cssText = 'display: flex; gap: 10px; margin-top: 10px;';
+        
+        const submitBtn = document.createElement('button');
+        submitBtn.textContent = 'Submit';
+        submitBtn.style.cssText = `
+            flex: 1;
+            padding: 10px;
+            background: #4a9eff;
+            color: #fff;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: bold;
+        `;
+        
+        const cancelBtn = document.createElement('button');
+        cancelBtn.textContent = 'Cancel';
+        cancelBtn.style.cssText = `
+            flex: 1;
+            padding: 10px;
+            background: #666;
+            color: #fff;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: bold;
+        `;
+        
+        submitBtn.addEventListener('click', () => {
+            const message = input.value.trim();
+            if (message) {
+                block.userData.message = message;
+                // Sync to server
+                if (socket) {
+                    const blockKey = `${Math.round(block.position.x)},${block.userData.gridY},${Math.round(block.position.z)}`;
+                    const [x, y, z] = blockKey.split(',').map(Number);
+                    socket.emit('blockUpdate', { x, y, z, type: 'sign', message: message });
+                }
+            }
+            closeSignInput();
+        });
+        
+        cancelBtn.addEventListener('click', () => {
+            closeSignInput();
+        });
+        
+        input.addEventListener('keydown', (e) => {
+            // Prevent game controls from interfering
+            e.stopPropagation();
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                submitBtn.click();
+            } else if (e.key === 'Escape') {
+                e.preventDefault();
+                cancelBtn.click();
+            }
+            // Prevent all other keys from triggering game actions
+            e.stopImmediatePropagation();
+        });
+        
+        buttonContainer.appendChild(submitBtn);
+        buttonContainer.appendChild(cancelBtn);
+        inputContainer.appendChild(buttonContainer);
+        
+        document.body.appendChild(inputContainer);
+    }
+    
+    const input = document.getElementById('sign-input');
+    if (input) {
+        input.value = block.userData.message || '';
+        input.focus();
+        input.select();
+    }
+}
+
+// Close sign input field
+function closeSignInput() {
+    signInputOpen = false;
+    const inputContainer = document.getElementById('sign-input-container');
+    if (inputContainer) {
+        inputContainer.remove();
+    }
+    updateEIndicator();
+}
+
+// Update sign speech bubbles
+function updateSignBubbles() {
+    if (!localPlayer) return;
+    
+    const playerPos = localPlayer.position;
+    const checkDistance = 3.0; // 3 block distance
+    
+    // Remove old sign bubbles
+    const oldBubbles = document.querySelectorAll('.sign-bubble');
+    oldBubbles.forEach(bubble => bubble.remove());
+    
+    // Check all signs
+    for (const [key, block] of blocks.entries()) {
+        if (block.userData.type !== 'sign') continue;
+        if (!block.userData.message) continue;
+        
+        const blockPos = block.position;
+        const distance = playerPos.distanceTo(blockPos);
+        
+        if (distance <= checkDistance) {
+            // Show speech bubble above sign
+            const bubble = document.createElement('div');
+            bubble.className = 'sign-bubble';
+            bubble.textContent = block.userData.message;
+            bubble.style.cssText = `
+                position: fixed;
+                background: rgba(255, 255, 255, 0.95);
+                color: #000;
+                padding: 8px 12px;
+                border-radius: 12px;
+                font-size: 12px;
+                max-width: 200px;
+                word-wrap: break-word;
+                box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+                pointer-events: none;
+                z-index: 100;
+            `;
+            
+            // Position above sign block
+            const headWorldPos = new THREE.Vector3(blockPos.x, blockPos.y + 1.5, blockPos.z);
+            const vector = headWorldPos.project(camera);
+            const x = Math.round((vector.x * 0.5 + 0.5) * window.innerWidth);
+            const y = Math.round((-vector.y * 0.5 + 0.5) * window.innerHeight);
+            
+            bubble.style.left = x + 'px';
+            bubble.style.top = (y - 30) + 'px';
+            bubble.style.transform = 'translate(-50%, -100%)';
+            
+            document.body.appendChild(bubble);
+        }
+    }
 }
 
 // Animation loop
@@ -4503,6 +5210,10 @@ function animate() {
 
     // Update camera
     updateCamera();
+    
+    // Check for nearby interactive blocks and update UI
+    checkNearbyInteractiveBlocks();
+    updateSignBubbles();
 
     // Update animations
     if (localPlayer) {

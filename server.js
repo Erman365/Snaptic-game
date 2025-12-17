@@ -82,6 +82,10 @@ io.on('connection', (socket) => {
     socket.on('playerMove', (data) => {
         const player = players.get(playerId);
         if (player) {
+            // Don't accept position updates from dead players
+            if (player.health !== undefined && player.health <= 0) {
+                return; // Reject movement updates from dead players
+            }
             player.position = data.position;
             player.rotation = data.rotation;
             player.headRotation = data.headRotation || { x: 0, y: 0, z: 0 };
@@ -129,6 +133,21 @@ io.on('connection', (socket) => {
             io.emit('blockRemoved', data);
         }
     });
+    
+    // Handle block updates (door state, sign messages)
+    socket.on('blockUpdate', (data) => {
+        const blockKey = `${data.x},${data.y},${data.z}`;
+        const block = blocks.get(blockKey);
+        if (block) {
+            if (data.type === 'door') {
+                block.isOpen = data.isOpen || false;
+            } else if (data.type === 'sign') {
+                block.message = data.message || '';
+            }
+            // Broadcast update to all clients
+            io.emit('blockUpdated', { key: blockKey, ...block });
+        }
+    });
 
     // Handle baseball bat hit - launch player and trigger ragdoll
     socket.on('playerBatHit', (data) => {
@@ -174,7 +193,8 @@ io.on('connection', (socket) => {
         const attacker = players.get(playerId);
         const target = players.get(data.targetId);
         
-        if (attacker && target && attacker.id !== target.id) {
+        // Allow normal hits (attacker !== target) and explicit self-damage (for reset)
+        if (attacker && target && (attacker.id !== target.id || data.allowSelf)) {
             // Initialize health if not set
             if (target.health === undefined) {
                 target.health = 100;
@@ -281,6 +301,14 @@ io.on('connection', (socket) => {
                 item: data.item
             });
         }
+    });
+
+    // Handle player using an item that has a swing animation (sword, baseball bat)
+    socket.on('playerUseItemSwing', (data) => {
+        socket.broadcast.emit('playerUseItemSwing', {
+            playerId: playerId,
+            item: data.item
+        });
     });
 
     // Handle player arm swing (for block placement/destruction)
