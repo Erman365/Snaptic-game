@@ -21,7 +21,7 @@ let playerColor = 0x4a9eff;
 let playerHat = 'none';
 
 // Inventory and combat system
-let inventory = ['sword', 'cheeseburger', 'soda', 'baseballbat'];
+let inventory = ['sword', 'cheeseburger', 'soda', 'baseballbat', 'car'];
 let selectedInventoryIndex = 0;
 let inventoryOpen = false;
 let playerHealth = 100;
@@ -29,6 +29,13 @@ let maxHealth = 100;
 let isSwinging = false;
 let isUsingItem = false;
 let itemUseTime = 0;
+
+// Car system
+let cars = new Map(); // Track all cars in the game
+let currentCar = null; // Car the local player is currently in
+let carSeatIndex = -1; // Which seat the player is in (0 = driver, 1-3 = passengers)
+let carSteeringAngle = 0; // Current steering angle for the car (local player's steering input)
+let lastClickPosition = null; // Store last mouse click position for car spawning
 
 // Pixelation settings
 const PIXELATION_FACTOR = 2; // Higher = smaller pixels, more pixels (reduced for less pixelation)
@@ -835,13 +842,35 @@ function setupControls() {
                     return; // Exit early to prevent any other processing
                 }
                 
-                // Interact with nearby door or sign
+                // Interact with nearby door, sign, or car
                 if (nearbyInteractiveBlock) {
                     e.preventDefault();
-                    const block = nearbyInteractiveBlock.block;
-                    const blockType = block.userData.type;
                     
-                    if (blockType === 'door') {
+                    // Handle exit car (check this first if in car)
+                    if (currentCar) {
+                        exitCar();
+                        return;
+                    }
+                    
+                    // Handle car entry (only if not in a car)
+                    if (nearbyInteractiveBlock && nearbyInteractiveBlock.type === 'car') {
+                        const car = nearbyInteractiveBlock.car;
+                        // Find closest empty seat
+                        for (let i = 0; i < 4; i++) {
+                            if (car.userData.seats[i] === null) {
+                                enterCar(car, i);
+                                return;
+                            }
+                        }
+                        return;
+                    }
+                    
+                    // Handle blocks (doors, signs)
+                    if (nearbyInteractiveBlock.type === 'block') {
+                        const block = nearbyInteractiveBlock.block;
+                        const blockType = block.userData.type;
+                        
+                        if (blockType === 'door') {
                         // Toggle door and all adjacent door blocks
                         const blockKey = nearbyInteractiveBlock.key;
                         const [x, y, z] = blockKey.split(',').map(Number);
@@ -873,9 +902,10 @@ function setupControls() {
                                 socket.emit('blockUpdate', { x: dx, y: dy, z: dz, type: 'door', isOpen: newState });
                             }
                         });
-                    } else if (blockType === 'sign') {
-                        // Open sign input field
-                        openSignInput(block);
+                        } else if (blockType === 'sign') {
+                            // Open sign input field
+                            openSignInput(block);
+                        }
                     }
                 }
                 break;
@@ -1092,11 +1122,15 @@ function setupControls() {
         const raycaster = new THREE.Raycaster();
         raycaster.setFromCamera(mouse, camera);
         
-        // Check intersections with blocks and ground
+        // Check intersections with blocks, ground, and cars
         const allObjects = Array.from(blocks.values());
         if (scene.children.find(c => c.userData.isGround)) {
             allObjects.push(scene.children.find(c => c.userData.isGround));
         }
+        // Add cars to raycaster
+        cars.forEach(car => {
+            allObjects.push(car);
+        });
         const intersects = raycaster.intersectObjects(allObjects, true);
 
         // Handle item usage or building/deleting based on mode (only left click)
@@ -1104,14 +1138,28 @@ function setupControls() {
             // Don't allow actions when dead
             if (playerHealth <= 0) return;
             
+            // Note: Car entry is now handled with E key, not mouse clicks
+            
             // If inventory is open, use item
             if (inventoryOpen) {
+                // Store click position for car spawning
+                if (intersects.length > 0) {
+                    lastClickPosition = intersects[0].point.clone();
+                } else {
+                    lastClickPosition = null;
+                }
                 useItem(localPlayer);
                 return;
             }
             
             // If nothing mode and item equipped, use item
             if (buildMode === null && localPlayer && localPlayer.userData.equippedItem) {
+                // Store click position for car spawning
+                if (intersects.length > 0) {
+                    lastClickPosition = intersects[0].point.clone();
+                } else {
+                    lastClickPosition = null;
+                }
                 useItem(localPlayer);
                 return;
             }
@@ -2951,7 +2999,7 @@ function updateInventoryUI() {
     
     if (inventoryOpen) {
         inventoryDiv.style.display = 'block';
-        const itemNames = { sword: '⚔️ Sword', cheeseburger: '🍔 Cheeseburger', soda: '🥤 Soda', baseballbat: '⚾ Baseball Bat' };
+        const itemNames = { sword: '⚔️ Sword', cheeseburger: '🍔 Cheeseburger', soda: '🥤 Soda', baseballbat: '⚾ Baseball Bat', car: '🚗 Car' };
         inventoryDiv.innerHTML = `
             <h2 style="color: #fff; margin-bottom: 20px; text-align: center;">Inventory</h2>
             <div style="display: flex; gap: 20px; justify-content: center;">
@@ -2966,7 +3014,7 @@ function updateInventoryUI() {
                         min-width: 120px;
                     ">
                         <div style="font-size: 48px; margin-bottom: 10px;">${itemNames[item] || item}</div>
-                        <div style="color: #fff; font-size: 14px;">${item === 'sword' ? '25 Damage' : item === 'baseballbat' ? 'Ragdoll' : item === 'cheeseburger' ? 'Heal' : 'Heal'}</div>
+                        <div style="color: #fff; font-size: 14px;">${item === 'sword' ? '25 Damage' : item === 'baseballbat' ? 'Ragdoll' : item === 'cheeseburger' ? 'Heal' : item === 'soda' ? 'Heal' : item === 'car' ? 'Spawn Car' : ''}</div>
                     </div>
                 `).join('')}
             </div>
@@ -3059,6 +3107,26 @@ function useItem(player) {
                     health: playerHealth
                 });
             }
+        }
+    } else if (item === 'car') {
+        // Spawn car at click position if available, otherwise in front of player
+        if (player === localPlayer) {
+            let spawnPosition = null;
+            
+            if (lastClickPosition) {
+                // Use the stored click position
+                spawnPosition = lastClickPosition.clone();
+                lastClickPosition = null; // Clear after use
+            } else {
+                // Fallback: spawn in front of player
+                const forwardX = Math.sin(localPlayer.rotation.y);
+                const forwardZ = Math.cos(localPlayer.rotation.y);
+                spawnPosition = localPlayer.position.clone();
+                spawnPosition.x += forwardX * 3;
+                spawnPosition.z += forwardZ * 3;
+            }
+            
+            spawnCar(spawnPosition);
         }
     }
     
@@ -4044,6 +4112,28 @@ function connectToServer() {
         data.blocks.forEach(blockData => {
             addBlock(blockData.x, blockData.y, blockData.z, blockData.type);
         });
+        
+        // Add existing cars
+        if (data.cars) {
+            data.cars.forEach(carData => {
+                const car = createCar();
+                car.position.set(carData.position.x, carData.position.y, carData.position.z);
+                car.rotation.y = carData.rotation.y;
+                car.userData.carId = carData.carId;
+                car.userData.velocity = new THREE.Vector3(0, 0, 0);
+                car.userData.angularVelocity = { pitch: 0, roll: 0 }; // Initialize as object, not number
+                car.userData.acceleration = 0;
+                car.userData.steeringAngle = 0;
+                car.userData.seats = carData.seats || [null, null, null, null];
+                car.userData.suspensionRestLength = 0.2;
+                car.userData.wheelBase = 2.0;
+                car.userData.trackWidth = 1.5;
+                car.userData.ownerId = carData.ownerId;
+                car.userData.smoothedY = undefined; // Will be initialized in updateCar
+                scene.add(car);
+                cars.set(carData.carId, car);
+            });
+        }
     });
 
     socket.on('playerJoined', (playerData) => {
@@ -4063,6 +4153,75 @@ function connectToServer() {
             player.userData.isMoving = distance > 0.01;
             // Sync sprint state for animation
             player.userData.isSprinting = data.isSprinting || false;
+        }
+    });
+    
+    // Handle car spawn from other players
+    socket.on('carSpawned', (carData) => {
+        // Only create if we don't already have this car
+        if (!cars.has(carData.carId)) {
+            const car = createCar();
+            car.position.set(carData.position.x, carData.position.y, carData.position.z);
+            car.rotation.y = carData.rotation.y;
+            car.userData.carId = carData.carId;
+            car.userData.velocity = new THREE.Vector3(0, 0, 0);
+            car.userData.angularVelocity = { pitch: 0, roll: 0 }; // Fix: Initialize as object, not number
+            car.userData.acceleration = 0;
+            car.userData.steeringAngle = 0;
+            car.userData.seats = carData.seats || [null, null, null, null];
+            car.userData.suspensionRestLength = 0.05; // Match original spawn
+            car.userData.wheelBase = 2.0;
+            car.userData.trackWidth = 1.5;
+            car.userData.ownerId = carData.ownerId;
+            car.userData.smoothedY = undefined; // Will be initialized in updateCar
+            scene.add(car);
+            cars.set(carData.carId, car);
+        }
+    });
+    
+    // Handle car position/rotation update from other players
+    socket.on('carUpdated', (data) => {
+        const car = cars.get(data.carId);
+        // Only skip sync if we're the driver (seatIndex 0) - passengers should still see updates
+        if (car && !(currentCar === car && carSeatIndex === 0)) {
+            // Smoothly interpolate to new position
+            car.position.lerp(new THREE.Vector3(data.position.x, data.position.y, data.position.z), 0.3);
+            car.rotation.x = THREE.MathUtils.lerp(car.rotation.x, data.rotation.x, 0.3);
+            car.rotation.y = THREE.MathUtils.lerp(car.rotation.y, data.rotation.y, 0.5);
+            car.rotation.z = THREE.MathUtils.lerp(car.rotation.z, data.rotation.z, 0.3);
+        }
+    });
+    
+    // Handle player entering car
+    socket.on('playerEnteredCar', (data) => {
+        const player = otherPlayers.get(data.playerId);
+        const car = cars.get(data.carId);
+        if (player && car) {
+            player.userData.inCar = data.carId;
+            player.userData.carSeatIndex = data.seatIndex;
+            // Hide player model when in car
+            player.visible = false;
+            // Update car seats
+            if (car.userData.seats) {
+                car.userData.seats[data.seatIndex] = player;
+            }
+        }
+    });
+    
+    // Handle player exiting car
+    socket.on('playerExitedCar', (data) => {
+        const player = otherPlayers.get(data.playerId);
+        const car = cars.get(data.carId);
+        if (player && car) {
+            player.userData.inCar = null;
+            const oldSeatIndex = player.userData.carSeatIndex;
+            player.userData.carSeatIndex = null;
+            // Make player visible again when exiting car
+            player.visible = true;
+            // Clear car seat
+            if (car.userData.seats && oldSeatIndex !== null && oldSeatIndex !== undefined) {
+                car.userData.seats[oldSeatIndex] = null;
+            }
         }
     });
 
@@ -4101,11 +4260,12 @@ function connectToServer() {
     });
     
     socket.on('blockUpdated', (data) => {
-        const blockKey = `${data.x},${data.y},${data.z}`;
+        // Use key field if available, otherwise reconstruct from x, y, z
+        const blockKey = data.key || `${data.x},${data.y},${data.z}`;
         const block = blocks.get(blockKey);
         if (block) {
             if (data.type === 'door') {
-                block.userData.isOpen = data.isOpen || false;
+                block.userData.isOpen = data.isOpen !== undefined ? data.isOpen : false;
                 if (block.userData.isOpen) {
                     block.material.opacity = 0.3;
                     block.material.transparent = true;
@@ -4113,6 +4273,7 @@ function connectToServer() {
                     block.material.opacity = 1.0;
                     block.material.transparent = false;
                 }
+                block.material.needsUpdate = true;
             } else if (data.type === 'sign') {
                 block.userData.message = data.message || '';
             }
@@ -4774,6 +4935,58 @@ function updatePlayerMovement(delta) {
         }
     }
 
+    // Player-to-car collision detection
+    if (!currentCar && playerHealth > 0) { // Only check if not in a car
+        cars.forEach((car) => {
+            const carPos = car.position;
+            const localPos = localPlayer.position;
+            
+            // Car bounds (width, length, height)
+            const carWidth = 2.5;
+            const carLength = 4.0;
+            const carHeight = 2.0; // Approximate car height
+            
+            // Check if player is within car bounds horizontally
+            const horizontalDistance = Math.sqrt(
+                Math.pow(localPos.x - carPos.x, 2) + 
+                Math.pow(localPos.z - carPos.z, 2)
+            );
+            
+            // Check if player is at similar height (within car height range)
+            const verticalDistance = Math.abs(localPos.y - carPos.y);
+            
+            // Check collision (player radius + half car width/length)
+            const playerRadius = 0.25;
+            const minDistanceX = playerRadius + carWidth / 2;
+            const minDistanceZ = playerRadius + carLength / 2;
+            
+            if (Math.abs(localPos.x - carPos.x) < minDistanceX &&
+                Math.abs(localPos.z - carPos.z) < minDistanceZ &&
+                verticalDistance < carHeight / 2 + 0.5) {
+                // Push player away from car
+                const pushDirection = new THREE.Vector3(
+                    localPos.x - carPos.x,
+                    0,
+                    localPos.z - carPos.z
+                ).normalize();
+                
+                // Calculate overlap and push
+                const dx = Math.abs(localPos.x - carPos.x);
+                const dz = Math.abs(localPos.z - carPos.z);
+                const overlapX = minDistanceX - dx;
+                const overlapZ = minDistanceZ - dz;
+                const pushAmount = Math.max(overlapX, overlapZ) * 0.5;
+                
+                localPlayer.position.x += pushDirection.x * pushAmount;
+                localPlayer.position.z += pushDirection.z * pushAmount;
+                
+                // Reduce velocity when colliding
+                velocity.x *= 0.5;
+                velocity.z *= 0.5;
+            }
+        });
+    }
+    
     // Player-to-player collision detection
     const playerCollisionRadius = 0.25; // Player radius
     for (const [otherPlayerId, otherPlayer] of otherPlayers.entries()) {
@@ -4944,7 +5157,7 @@ function updateCamera() {
     camera.lookAt(lookAtPos);
 }
 
-// Check for nearby interactive blocks (doors, signs)
+// Check for nearby interactive blocks (doors, signs) and cars
 function checkNearbyInteractiveBlocks() {
     if (!localPlayer) {
         nearbyInteractiveBlock = null;
@@ -4953,11 +5166,12 @@ function checkNearbyInteractiveBlocks() {
     }
     
     const playerPos = localPlayer.position;
-    const checkDistance = 2.0; // 2 block distance
+    const checkDistance = 4.0; // 4 block distance (increased for cars)
     
     let closestBlock = null;
     let closestDistance = Infinity;
     
+    // Check blocks (doors, signs)
     for (const [key, block] of blocks.entries()) {
         const blockType = block.userData.type;
         if (blockType !== 'door' && blockType !== 'sign') continue;
@@ -4967,9 +5181,39 @@ function checkNearbyInteractiveBlocks() {
         
         if (distance <= checkDistance && distance < closestDistance) {
             closestDistance = distance;
-            closestBlock = { block, key };
+            closestBlock = { block, key, type: 'block' };
         }
     }
+    
+    // Check cars - always check if in a car (to allow exit), otherwise only if not in car (to allow entry)
+    // Use larger distance for cars to account for hitbox
+    const carCheckDistance = 5.0; // Larger distance for cars
+    cars.forEach((car) => {
+        const carPos = car.position;
+        const distance = playerPos.distanceTo(carPos);
+        
+        if (distance <= carCheckDistance && distance < closestDistance) {
+            // If in this car, prioritize it for exit
+            if (currentCar === car) {
+                closestDistance = distance;
+                closestBlock = { car, type: 'car' };
+            } else if (!currentCar) {
+                // Check if car has empty seats (only if not already in a car)
+                let hasEmptySeat = false;
+                for (let i = 0; i < 4; i++) {
+                    if (car.userData.seats[i] === null) {
+                        hasEmptySeat = true;
+                        break;
+                    }
+                }
+                
+                if (hasEmptySeat) {
+                    closestDistance = distance;
+                    closestBlock = { car, type: 'car' };
+                }
+            }
+        }
+    });
     
     nearbyInteractiveBlock = closestBlock;
     updateEIndicator();
@@ -4979,7 +5223,18 @@ function checkNearbyInteractiveBlocks() {
 function updateEIndicator() {
     let indicator = document.getElementById('e-indicator');
     
+    // Don't show indicator when in a car (no need to show "press E to exit" constantly)
+    if (currentCar) {
+        if (indicator) indicator.style.display = 'none';
+        return;
+    }
+    
     if (nearbyInteractiveBlock && !signInputOpen) {
+        // For cars, show enter indicator
+        if (nearbyInteractiveBlock.type === 'car') {
+            // Show enter indicator when not in any car
+        }
+        
         if (!indicator) {
             indicator = document.createElement('div');
             indicator.id = 'e-indicator';
@@ -4998,9 +5253,20 @@ function updateEIndicator() {
                 pointer-events: none;
                 border: 2px solid #4a9eff;
             `;
-            indicator.textContent = 'Press E';
             document.body.appendChild(indicator);
         }
+        
+        // Set appropriate text based on what's nearby
+        if (nearbyInteractiveBlock.type === 'car') {
+            if (currentCar && nearbyInteractiveBlock.car === currentCar) {
+                indicator.textContent = 'Press E to Exit';
+            } else {
+                indicator.textContent = 'Press E to Enter';
+            }
+        } else {
+            indicator.textContent = 'Press E';
+        }
+        
         indicator.style.display = 'block';
     } else {
         if (indicator) {
@@ -5194,6 +5460,970 @@ function updateSignBubbles() {
 }
 
 // Animation loop
+// Spawn a car at the specified position (or in front of player if not provided)
+function spawnCar(spawnPosition = null) {
+    if (!localPlayer) return;
+    
+    // Use provided position or calculate spawn position in front of player
+    let spawnPos;
+    if (spawnPosition) {
+        spawnPos = spawnPosition.clone();
+    } else {
+        const forwardX = Math.sin(localPlayer.rotation.y);
+        const forwardZ = Math.cos(localPlayer.rotation.y);
+        spawnPos = localPlayer.position.clone();
+        spawnPos.x += forwardX * 3;
+        spawnPos.z += forwardZ * 3;
+    }
+    
+    // Find ground level (check for blocks, otherwise use ground plane at y=0)
+    // Wheel bottom is at y=0 relative to car, so car y position = ground level
+    let groundY = 0.5; // Default ground level (block top at y=0.5)
+    const checkX = Math.round(spawnPos.x);
+    const checkZ = Math.round(spawnPos.z);
+    
+    // Check for highest block at this position
+    for (let checkY = 50; checkY >= -10; checkY--) {
+        const blockKey = `${checkX},${checkY},${checkZ}`;
+        if (blocks.has(blockKey)) {
+            const block = blocks.get(blockKey);
+            groundY = block.y + 0.5; // Block top
+            break;
+        }
+    }
+    
+    spawnPos.y = groundY; // Car position (wheel bottom will be at this Y)
+    
+    const car = createCar();
+    car.position.copy(spawnPos);
+    car.rotation.y = localPlayer.rotation.y;
+    
+    // Generate unique ID for car
+    const carId = `car_${Date.now()}_${Math.random()}`;
+    car.userData.carId = carId;
+    car.userData.velocity = new THREE.Vector3(0, 0, 0);
+    car.userData.angularVelocity = { pitch: 0, roll: 0 }; // Initialize as object for pitch/roll
+    car.userData.acceleration = 0; // Per-car acceleration
+    car.userData.steeringAngle = 0; // Per-car steering angle
+    car.userData.smoothedY = undefined; // Will be initialized in updateCar
+    car.userData.seats = [null, null, null, null]; // 4 seats: driver, passenger front, passenger back left, passenger back right
+    car.userData.suspensionRestLength = 0.05; // Minimal suspension - just a tiny bit for smoothness
+    car.userData.wheelBase = 2.0; // Distance between front and back wheels
+    car.userData.trackWidth = 1.5; // Distance between left and right wheels
+    car.userData.ownerId = socket ? socket.id : null; // Track who spawned the car
+    
+    scene.add(car);
+    cars.set(carId, car);
+    
+    // Sync car spawn to server
+    if (socket) {
+        socket.emit('carSpawned', {
+            carId: carId,
+            position: { x: spawnPos.x, y: spawnPos.y, z: spawnPos.z },
+            rotation: { x: 0, y: car.rotation.y, z: 0 }
+        });
+    }
+}
+
+// Create car visual model
+function createCar() {
+    const carGroup = new THREE.Group();
+    
+    // Car body material
+    const carBodyMaterial = new THREE.MeshStandardMaterial({
+        color: 0x4a9eff,
+        metalness: 0.8,
+        roughness: 0.2
+    });
+    
+    // Car body (main chassis) - positioned to sit on wheels
+    const bodyGeometry = new THREE.BoxGeometry(2.5, 1.2, 4.0);
+    const body = new THREE.Mesh(bodyGeometry, carBodyMaterial);
+    body.position.y = 0.6; // Body center at 0.6 (same as wheel radius, so body sits on wheels)
+    body.castShadow = true;
+    body.receiveShadow = true;
+    carGroup.add(body);
+    carGroup.userData.bodyMesh = body; // Store body mesh reference for pitch rotation
+    
+    // Car roof - add as child of body so it rotates with body for pitch
+    const roofGeometry = new THREE.BoxGeometry(2.2, 0.8, 1.8);
+    const roof = new THREE.Mesh(roofGeometry, carBodyMaterial);
+    roof.position.set(0, 1.0, -0.3); // Position relative to body (body center is at y=0.6, roof was at y=1.6, so relative is 1.0)
+    roof.castShadow = true;
+    roof.receiveShadow = true;
+    body.add(roof); // Add roof as child of body instead of carGroup
+    
+    // Wheel material (black)
+    const wheelMaterial = new THREE.MeshStandardMaterial({
+        color: 0x1a1a1a,
+        metalness: 0.3,
+        roughness: 0.7
+    });
+    
+    // Wheel positions: front left, front right, back left, back right
+    // Position wheels close to car body sides (car body is 2.5 wide, so at ±1.25)
+    // Wheels at ±1.0 are closer to the body center
+    const wheelPositions = [
+        { x: -1.0, z: 1.0 },  // Front left
+        { x: 1.0, z: 1.0 },   // Front right
+        { x: -1.0, z: -1.0 }, // Back left
+        { x: 1.0, z: -1.0 }   // Back right
+    ];
+    
+    // Create wheels - make them bigger (radius 0.6, width 0.4)
+    const wheelRadius = 0.6;
+    const wheelWidth = 0.4;
+    const wheelGeometry = new THREE.CylinderGeometry(wheelRadius, wheelRadius, wheelWidth, 16);
+    const wheels = [];
+    
+    wheelPositions.forEach((pos, index) => {
+        const wheelGroup = new THREE.Group();
+        const wheel = new THREE.Mesh(wheelGeometry, wheelMaterial);
+        wheel.rotation.z = Math.PI / 2; // Rotate wheel to be horizontal
+        wheel.position.y = 0; // Wheel center is at the wheel group's origin
+        wheel.castShadow = true;
+        wheel.receiveShadow = true;
+        wheelGroup.add(wheel);
+        
+        // Position wheel group relative to car body (wheels are at bottom)
+        // Make wheels children of body so they rotate with body's pitch and roll
+        // Body center is at y=0.6 relative to carGroup, wheels were at y=0.6 (wheelRadius) relative to carGroup
+        // So wheels should be at y=0 relative to body center to maintain same world position
+        wheelGroup.position.set(pos.x, 0, pos.z); // Y=0 relative to body center (wheel center aligns with body center)
+        wheelGroup.userData.isFrontWheel = index < 2; // First two are front wheels
+        wheelGroup.userData.suspensionOffset = 0;
+        wheelGroup.userData.rotation = 0; // For wheel spin
+        wheelGroup.userData.steeringAngle = 0; // For steering (front wheels only)
+        
+        body.add(wheelGroup); // Add wheels as children of body so they pitch with it
+        wheels.push(wheelGroup);
+    });
+    
+    carGroup.userData.wheels = wheels;
+    
+    // Seat positions (relative to car center)
+    carGroup.userData.seatPositions = [
+        { x: 0.4, y: 0.9, z: 0.3 },    // Driver (left front) - positive x is left side from driver's perspective
+        { x: -0.4, y: 0.9, z: 0.3 },   // Passenger front (right front)
+        { x: 0.4, y: 0.9, z: -0.5 },   // Back left
+        { x: -0.4, y: 0.9, z: -0.5 }   // Back right
+    ];
+    
+    return carGroup;
+}
+
+// Update car physics and movement
+function updateCar(car, delta) {
+    if (!car || !car.userData.velocity) return;
+    
+    // Initialize vertical velocity if not exists
+    if (car.userData.velocity.y === undefined) {
+        car.userData.velocity.y = 0;
+    }
+    
+    // Get wheel raycast positions (for suspension)
+    const wheels = car.userData.wheels || [];
+    
+    // HITBOX COLLISION CHECK: Detect walls BEFORE moving (use current position)
+    // Check if car is tilted 35+ degrees (allows wall driving)
+    const bodyMesh = car.userData.bodyMesh;
+    const carPitch = bodyMesh ? (bodyMesh.rotation.x || 0) : 0;
+    const isTiltedBack = carPitch < -0.611; // -35 degrees in radians (negative = tilted back)
+    
+    // Store current position for hitbox check
+    const currentCarPos = car.position.clone();
+    const currentCarY = car.position.y;
+    
+    // Only check for walls if NOT already tilted 35+ degrees
+    if (!isTiltedBack) {
+        // Get velocity direction
+        const velocityX = car.userData.velocity.x;
+        const velocityZ = car.userData.velocity.z;
+        const speed = Math.sqrt(velocityX * velocityX + velocityZ * velocityZ);
+        
+        if (speed > 0.1) {
+            // Normalize velocity direction
+            const moveDirX = velocityX / speed;
+            const moveDirZ = velocityZ / speed;
+            
+            // For high-speed collision detection, check multiple points along the movement path
+            // Use smaller step size for better accuracy at high speeds
+            const movementDistance = speed * delta;
+            const maxStepSize = 0.15; // Smaller step size for better detection
+            const numChecks = Math.max(5, Math.ceil(movementDistance / maxStepSize));
+            const stepSize = movementDistance / numChecks;
+            
+            const carWidth = 1.2; // Approximate car width
+            const carHeightMin = currentCarY - 0.6; // Bottom of car
+            const carHeightMax = currentCarY + 1.0; // Top of car (approximate)
+            
+            let hitWall = false;
+            let maxWallHeight = -Infinity;
+            
+            // Check along the movement path from CURRENT position
+            for (let step = 1; step <= numChecks; step++) {
+                const checkDistance = step * stepSize;
+                const checkX = currentCarPos.x + moveDirX * checkDistance;
+                const checkZ = currentCarPos.z + moveDirZ * checkDistance;
+                
+                // Check multiple points across car width at this step
+                const checkPoints = [
+                    { x: checkX, z: checkZ }, // Front center
+                    { x: checkX + moveDirZ * carWidth * 0.5, z: checkZ - moveDirX * carWidth * 0.5 }, // Front right
+                    { x: checkX - moveDirZ * carWidth * 0.5, z: checkZ + moveDirX * carWidth * 0.5 }, // Front left
+                ];
+                
+                checkPoints.forEach(checkPoint => {
+                    const blockGridX = Math.round(checkPoint.x);
+                    const blockGridZ = Math.round(checkPoint.z);
+                    
+                    // Check all blocks
+                    blocks.forEach((block) => {
+                        const blockPos = block.position;
+                        const blockGridXBlock = Math.round(blockPos.x);
+                        const blockGridZBlock = Math.round(blockPos.z);
+                        
+                        // Check if block is in the path
+                        if (blockGridX === blockGridXBlock && blockGridZ === blockGridZBlock) {
+                            const gridY = block.userData.gridY !== undefined ? block.userData.gridY : Math.round(blockPos.y - 0.5);
+                            const blockBottom = gridY;
+                            const blockTop = gridY + 1;
+                            
+                            // Only check blocks that are at the car's height level (not platforms above)
+                            // Block must overlap with car's vertical range to be considered a wall
+                            if (blockBottom <= carHeightMax && blockTop >= carHeightMin) {
+                                // Count wall height at this X,Z position (check all blocks stacked here)
+                                let wallHeight = 0;
+                                let minWallY = Infinity;
+                                let maxWallY = -Infinity;
+                                
+                                blocks.forEach(checkBlock => {
+                                    const checkBlockPos = checkBlock.position;
+                                    const checkBlockGridX = Math.round(checkBlockPos.x);
+                                    const checkBlockGridZ = Math.round(checkBlockPos.z);
+                                    const checkBlockGridY = checkBlock.userData.gridY !== undefined ? 
+                                        checkBlock.userData.gridY : Math.round(checkBlockPos.y - 0.5);
+                                    
+                                    if (blockGridX === checkBlockGridX && blockGridZ === checkBlockGridZ) {
+                                        // Same X,Z position - count as part of wall
+                                        if (checkBlockGridY < minWallY) minWallY = checkBlockGridY;
+                                        if (checkBlockGridY > maxWallY) maxWallY = checkBlockGridY;
+                                        wallHeight = maxWallY - minWallY + 1;
+                                    }
+                                });
+                                
+                                // If wall is 2+ blocks high, it's a collision
+                                if (wallHeight >= 2) {
+                                    hitWall = true;
+                                    if (gridY > maxWallHeight) {
+                                        maxWallHeight = gridY;
+                                    }
+                                }
+                            }
+                        }
+                    });
+                });
+                
+                // If we hit a wall, stop checking further along the path
+                if (hitWall && maxWallHeight >= 1) {
+                    break;
+                }
+            }
+            
+            // If wall is 2+ blocks high, stop the car immediately
+            if (hitWall && maxWallHeight >= 1) {
+                // Stop velocity completely when hitting a wall
+                car.userData.velocity.x = 0;
+                car.userData.velocity.z = 0;
+            }
+        }
+    }
+    
+    // Calculate new position (after hitbox check) to detect blocks at future position
+    const newCarPos = car.position.clone();
+    newCarPos.x += car.userData.velocity.x * delta;
+    newCarPos.z += car.userData.velocity.z * delta;
+    newCarPos.y += car.userData.velocity.y * delta; // Apply vertical velocity
+    
+    // Update suspension for each wheel - position wheels on ground/blocks
+    const groundY = 0;
+    const wheelRadius = 0.6; // Match the wheel radius from createCar (defined once here)
+    
+    // Temporarily move car to new position to calculate wheel positions correctly
+    const oldCarPos = car.position.clone();
+    car.position.copy(newCarPos);
+    // Update matrix to ensure world positions are calculated correctly
+    car.updateMatrixWorld(true);
+    
+    // Car's current vertical range - only check blocks within this range
+    const carBottomY = car.position.y - 0.6; // Bottom of car
+    const carTopY = car.position.y + 1.0; // Top of car (approximate)
+    const maxWheelClimb = 1.2; // Maximum height a wheel can climb in one frame
+    
+    wheels.forEach((wheelGroup, index) => {
+        // Get wheel's world X and Z position at NEW car position
+        // Use getWorldPosition to ensure accurate, symmetric transformation
+        const worldWheelPos = new THREE.Vector3();
+        wheelGroup.getWorldPosition(worldWheelPos);
+        
+        // Get current wheel height for climb limiting
+        const currentWheelY = wheelGroup.userData.targetWorldY !== undefined ? 
+            wheelGroup.userData.targetWorldY : worldWheelPos.y;
+        
+        // Find the highest valid surface (ground or block top) at this X,Z position
+        // Only check blocks within car's vertical range to prevent detecting platforms above
+        let highestSurface = groundY;
+        const blocksToCheck = Array.from(blocks.values());
+        
+        // Check multiple sample points on the wheel (center + 4 points around it)
+        const samplePoints = [
+            { x: 0, z: 0 },           // Center
+            { x: wheelRadius * 0.7, z: 0 },           // Right
+            { x: -wheelRadius * 0.7, z: 0 },          // Left
+            { x: 0, z: wheelRadius * 0.7 },          // Forward
+            { x: 0, z: -wheelRadius * 0.7 }           // Backward
+        ];
+        
+        samplePoints.forEach(sample => {
+            const checkX = worldWheelPos.x + sample.x;
+            const checkZ = worldWheelPos.z + sample.z;
+            
+            blocksToCheck.forEach(block => {
+                const blockPos = block.position;
+                const gridY = block.userData.gridY !== undefined ? block.userData.gridY : Math.round(blockPos.y - 0.5);
+                const blockTop = gridY + 1;
+                const blockBottom = gridY;
+                
+                // Use a reasonable detection radius (0.4)
+                const detectionRadius = 0.4;
+                
+                // Check if this sample point is within the block's detection area
+                const dx = checkX - blockPos.x;
+                const dz = checkZ - blockPos.z;
+                const distanceSq = dx * dx + dz * dz;
+                const detectionRadiusSq = detectionRadius * detectionRadius;
+                
+                if (distanceSq <= detectionRadiusSq) {
+                    // Only check blocks that overlap with car's vertical range (not platforms above)
+                    if (blockBottom <= carTopY && blockTop >= carBottomY) {
+                        // Check if this is a wall (2+ blocks high) - count blocks at this X,Z position
+                        if (!isTiltedBack) {
+                            // Count how many blocks are stacked at this X,Z position
+                            let wallHeight = 0;
+                            let minWallY = Infinity;
+                            let maxWallY = -Infinity;
+                            
+                            blocksToCheck.forEach(checkBlock => {
+                                const checkBlockPos = checkBlock.position;
+                                const checkBlockGridX = Math.round(checkBlockPos.x);
+                                const checkBlockGridZ = Math.round(checkBlockPos.z);
+                                const checkBlockGridY = checkBlock.userData.gridY !== undefined ? 
+                                    checkBlock.userData.gridY : Math.round(checkBlockPos.y - 0.5);
+                                
+                                if (Math.round(blockPos.x) === checkBlockGridX && 
+                                    Math.round(blockPos.z) === checkBlockGridZ) {
+                                    // Same X,Z position - count as part of wall
+                                    if (checkBlockGridY < minWallY) minWallY = checkBlockGridY;
+                                    if (checkBlockGridY > maxWallY) maxWallY = checkBlockGridY;
+                                    wallHeight = maxWallY - minWallY + 1;
+                                }
+                            });
+                            
+                            // If wall is 2+ blocks high, don't allow wheel to climb it
+                            if (wallHeight >= 2) {
+                                // Skip this block - don't allow climbing
+                                return;
+                            }
+                        }
+                        
+                        // This is a valid block surface - use the block top as surface
+                        if (blockTop > highestSurface) {
+                            highestSurface = blockTop;
+                        }
+                    }
+                }
+            });
+        });
+        
+        // Wheel center should be at surface height + wheel radius
+        const targetWheelWorldY = highestSurface + wheelRadius;
+        
+        // Limit how much the wheel can climb in one frame (prevent high-speed wall climbing)
+        const heightIncrease = targetWheelWorldY - currentWheelY;
+        let finalTargetWheelWorldY = targetWheelWorldY;
+        
+        if (heightIncrease > maxWheelClimb && !isTiltedBack) {
+            // Prevent climbing too high too fast (unless tilted for wall driving)
+            finalTargetWheelWorldY = currentWheelY + maxWheelClimb;
+        }
+        
+        // Store target height - car body will follow immediately (no suspension compression)
+        wheelGroup.userData.targetWorldY = finalTargetWheelWorldY;
+    });
+    
+    // Restore car position temporarily (will be updated based on wheel heights)
+    car.position.copy(oldCarPos);
+    
+    // Initialize car state if not exists
+    if (car.userData.acceleration === undefined) car.userData.acceleration = 0;
+    if (car.userData.steeringAngle === undefined) car.userData.steeringAngle = 0;
+    
+    // Update steering for front wheels (if player is driving)
+    if (currentCar === car && carSeatIndex === 0) {
+        const maxSteeringAngle = Math.PI / 6; // 30 degrees
+        let targetSteering = 0;
+        
+        if (moveState.left) targetSteering = maxSteeringAngle;
+        if (moveState.right) targetSteering = -maxSteeringAngle;
+        
+        // Smooth steering
+        car.userData.steeringAngle = THREE.MathUtils.lerp(car.userData.steeringAngle, targetSteering, delta * 5);
+        
+        // Apply steering to front wheels
+        wheels.forEach((wheelGroup, index) => {
+            if (wheelGroup.userData.isFrontWheel) {
+                wheelGroup.userData.steeringAngle = car.userData.steeringAngle;
+                wheelGroup.rotation.y = car.userData.steeringAngle;
+            }
+        });
+        
+        // Check if car is airborne (needed for controls) - use wheel target heights from suspension section
+        const carBottomY = car.position.y - 0.5;
+        let isAirborneForControls = false;
+        let avgWheelY = 0;
+        let wheelYCount = 0;
+        wheels.forEach((wheelGroup) => {
+            if (wheelGroup.userData.targetWorldY !== undefined) {
+                avgWheelY += wheelGroup.userData.targetWorldY;
+                wheelYCount++;
+            }
+        });
+        if (wheelYCount > 0) {
+            avgWheelY /= wheelYCount;
+            isAirborneForControls = carBottomY > avgWheelY + 0.15;
+        }
+        
+        // Uniform acceleration and deceleration (constant rates)
+        const acceleration = 30.0; // Forward acceleration (m/s²)
+        const deceleration = 35.0; // Deceleration when not accelerating (m/s²)
+        const braking = 60.0; // Braking when switching directions (m/s²) - faster than normal deceleration
+        const maxSpeed = 40.0; // Maximum speed in units/second (increased from 20)
+        const reverseMaxSpeed = maxSpeed * 0.5; // Reverse max speed
+        const reverseAcceleration = acceleration * 0.6; // Reverse acceleration
+        
+        // Get current speed
+        const currentSpeed = Math.sqrt(car.userData.velocity.x ** 2 + car.userData.velocity.z ** 2);
+        
+        // Get forward direction
+        const forwardX = Math.sin(car.rotation.y);
+        const forwardZ = Math.cos(car.rotation.y);
+        
+        // Get current velocity direction (normalized)
+        const velDir = currentSpeed > 0.01 ? 
+            new THREE.Vector2(car.userData.velocity.x / currentSpeed, car.userData.velocity.z / currentSpeed) :
+            new THREE.Vector2(forwardX, forwardZ);
+        
+        // Calculate dot product to determine if moving forward or backward relative to car direction
+        const forwardDir = new THREE.Vector2(forwardX, forwardZ);
+        const dotProduct = velDir.x * forwardDir.x + velDir.y * forwardDir.y;
+        const isMovingForward = currentSpeed > 0.1 && dotProduct > 0.3; // More strict threshold to prevent flipping
+        const isMovingBackward = currentSpeed > 0.1 && dotProduct < -0.3;
+        const speedThreshold = 0.5; // Must slow down to this speed before reversing
+        
+        // Only apply controls if car is on the ground (not airborne)
+        if (!isAirborneForControls) {
+            if (moveState.forward) {
+                // If currently moving backward with significant speed, brake first before accelerating forward
+                if (isMovingBackward && currentSpeed > speedThreshold) {
+                    // Braking - decelerate faster
+                    const newSpeed = Math.max(0, currentSpeed - braking * delta);
+                    car.userData.velocity.x = velDir.x * newSpeed;
+                    car.userData.velocity.z = velDir.y * newSpeed;
+                } else {
+                    // Accelerate forward with uniform acceleration (or continue forward if already moving forward)
+                    const newSpeed = Math.min(currentSpeed + acceleration * delta, maxSpeed);
+                    car.userData.velocity.x = forwardX * newSpeed;
+                    car.userData.velocity.z = forwardZ * newSpeed;
+                }
+            } else if (moveState.backward) {
+                // If currently moving forward with significant speed, brake first before reversing
+                if (isMovingForward && currentSpeed > speedThreshold) {
+                    // Braking - decelerate faster
+                    const newSpeed = Math.max(0, currentSpeed - braking * delta);
+                    car.userData.velocity.x = velDir.x * newSpeed;
+                    car.userData.velocity.z = velDir.y * newSpeed;
+                } else {
+                    // Accelerate backward with uniform acceleration (only if speed is low or already moving backward)
+                    const newSpeed = Math.min(currentSpeed + reverseAcceleration * delta, reverseMaxSpeed);
+                    car.userData.velocity.x = -forwardX * newSpeed;
+                    car.userData.velocity.z = -forwardZ * newSpeed;
+                }
+            } else {
+                // Uniform deceleration - maintain direction but slow down at constant rate
+                if (currentSpeed > 0.01) {
+                    const newSpeed = Math.max(0, currentSpeed - deceleration * delta);
+                    // Maintain direction when decelerating
+                    car.userData.velocity.x = velDir.x * newSpeed;
+                    car.userData.velocity.z = velDir.y * newSpeed;
+                } else {
+                    car.userData.velocity.x = 0;
+                    car.userData.velocity.z = 0;
+                }
+            }
+        }
+        // If airborne, don't apply any controls - car maintains its momentum
+        
+        // Apply turning based on steering and current speed
+        const finalSpeed = Math.sqrt(car.userData.velocity.x ** 2 + car.userData.velocity.z ** 2);
+        if (finalSpeed > 0.01 && Math.abs(car.userData.steeringAngle) > 0.01) {
+            const turnRate = Math.min(finalSpeed * 0.5, 2.0); // Max turn rate of 2.0 rad/s
+            // Invert turn direction when reversing
+            const turnDirection = moveState.backward ? -1 : 1;
+            const turnSpeed = turnRate * car.userData.steeringAngle * turnDirection;
+            car.rotation.y += turnSpeed * delta;
+            
+            // Update velocity direction to match new rotation (only when turning)
+            const newForwardX = Math.sin(car.rotation.y);
+            const newForwardZ = Math.cos(car.rotation.y);
+            
+            if (moveState.backward) {
+                car.userData.velocity.x = -newForwardX * finalSpeed;
+                car.userData.velocity.z = -newForwardZ * finalSpeed;
+            } else if (moveState.forward) {
+                car.userData.velocity.x = newForwardX * finalSpeed;
+                car.userData.velocity.z = newForwardZ * finalSpeed;
+            }
+            // If not accelerating, don't change velocity direction when turning (let it drift)
+        }
+        
+        // Update wheel rotation (visual spinning) based on actual velocity
+        const wheelSpeed = Math.sqrt(car.userData.velocity.x ** 2 + car.userData.velocity.z ** 2);
+        wheels.forEach((wheelGroup) => {
+            if (wheelGroup.userData.rotation === undefined) wheelGroup.userData.rotation = 0;
+            wheelGroup.userData.rotation += wheelSpeed * delta * 0.5;
+            if (wheelGroup.children[0]) {
+                wheelGroup.children[0].rotation.x = wheelGroup.userData.rotation;
+            }
+        });
+    } else {
+        // No driver, apply friction
+        car.userData.velocity.x *= 0.9;
+        car.userData.velocity.z *= 0.9;
+        car.userData.steeringAngle *= 0.9;
+        // Stop if very slow
+        const speed = Math.sqrt(car.userData.velocity.x ** 2 + car.userData.velocity.z ** 2);
+        if (speed < 0.1) {
+            car.userData.velocity.x = 0;
+            car.userData.velocity.z = 0;
+        }
+    }
+    
+    // Apply velocity to X and Z (no delta needed, velocity is already per-second)
+    car.position.x += car.userData.velocity.x * delta;
+    car.position.z += car.userData.velocity.z * delta;
+    
+    // Physics constants
+    const gravity = -18.0; // Gravity acceleration (negative = down) - reduced for more elongated trajectory
+    // groundY and wheelRadius are already defined above in suspension section
+    
+    // Calculate average wheel height for car Y position (use values already calculated in suspension section)
+    // Position car body based on average wheel height - this allows the car to tilt naturally
+    if (wheels.length >= 4) {
+        // Get wheel target heights that were already calculated in suspension section
+        let avgY = 0;
+        let wheelCount = 0;
+        let minWheelY = Infinity;
+        let maxWheelY = -Infinity;
+        
+        wheels.forEach((wheelGroup) => {
+            if (wheelGroup.userData.targetWorldY !== undefined) {
+                const wheelY = wheelGroup.userData.targetWorldY;
+                avgY += wheelY;
+                wheelCount++;
+                minWheelY = Math.min(minWheelY, wheelY);
+                maxWheelY = Math.max(maxWheelY, wheelY);
+            }
+        });
+        
+        if (wheelCount > 0) {
+            avgY /= wheelCount;
+            
+            // Check if car is airborne (all wheels are above their target surface)
+            // Car is considered airborne if its bottom (car.position.y - some offset) is above the lowest wheel target
+            const carBottomOffset = 0.5; // Approximate distance from car center to bottom
+            const carBottomY = car.position.y - carBottomOffset;
+            const lowestWheelTarget = minWheelY;
+            const isAirborne = carBottomY > lowestWheelTarget + 0.15; // Threshold to prevent jitter
+            
+            // Calculate forward speed for ramp physics
+            const forwardSpeed = Math.sqrt(car.userData.velocity.x ** 2 + car.userData.velocity.z ** 2);
+            
+            // Initialize smoothed Y position if not exists
+            if (car.userData.smoothedY === undefined) {
+                car.userData.smoothedY = avgY;
+            }
+            
+            if (isAirborne) {
+                // Apply gravity when airborne
+                car.userData.velocity.y += gravity * delta;
+                
+                // Update car Y position based on vertical velocity (parabolic trajectory)
+                car.position.y += car.userData.velocity.y * delta;
+                car.userData.smoothedY = car.position.y; // No smoothing when airborne
+                
+                // Check if car would hit the ground/blocks
+                const newCarBottomY = car.position.y - carBottomOffset;
+                if (newCarBottomY <= lowestWheelTarget) {
+                    // Car is touching ground - stop falling and set to wheel height
+                    car.position.y = avgY;
+                    car.userData.smoothedY = avgY;
+                    // Preserve some vertical velocity if landing on a slope (bounce slightly)
+                    if (car.userData.velocity.y < -2) {
+                        car.userData.velocity.y *= -0.3; // Small bounce on landing
+                    } else {
+                        car.userData.velocity.y = 0;
+                    }
+                }
+            } else {
+                // Car is on ground - check if it's going up a ramp
+                const heightDiff = maxWheelY - minWheelY;
+                const isOnRamp = heightDiff > 0.1; // Significant height difference indicates ramp
+                
+                if (isOnRamp && forwardSpeed > 0.5) {
+                    // On a ramp - only add upward velocity if wheels are near blocks (within 1.8 blocks below)
+                    // Check if any wheel is within 1.8 blocks of a block below it
+                    let wheelNearBlock = false;
+                    const maxDistanceBelow = 1.8; // Check 1.8 blocks below wheels
+                    
+                    wheels.forEach((wheelGroup) => {
+                        if (wheelGroup.userData.targetWorldY !== undefined) {
+                            const wheelY = wheelGroup.userData.targetWorldY;
+                            
+                            // Get wheel world X,Z position for block checking
+                            const wheelWorldPos = new THREE.Vector3();
+                            wheelGroup.getWorldPosition(wheelWorldPos);
+                            const wheelGridX = Math.round(wheelWorldPos.x);
+                            const wheelGridZ = Math.round(wheelWorldPos.z);
+                            
+                            // Check if there's a block within maxDistanceBelow below this wheel
+                            blocks.forEach((block) => {
+                                const blockPos = block.position;
+                                const blockGridX = Math.round(blockPos.x);
+                                const blockGridZ = Math.round(blockPos.z);
+                                const blockGridY = block.userData.gridY !== undefined ? 
+                                    block.userData.gridY : Math.round(blockPos.y - 0.5);
+                                
+                                // Check if block is at this wheel's X,Z position
+                                if (blockGridX === wheelGridX && blockGridZ === wheelGridZ) {
+                                    const blockTop = blockGridY + 1;
+                                    const distanceBelow = wheelY - blockTop;
+                                    // Wheel is near block if within maxDistanceBelow below
+                                    if (distanceBelow >= 0 && distanceBelow <= maxDistanceBelow) {
+                                        wheelNearBlock = true;
+                                    }
+                                }
+                            });
+                        }
+                    });
+                    
+                    // Only apply boost if wheels are near blocks (not airborne)
+                    if (wheelNearBlock) {
+                        // Estimate ramp angle from height difference
+                        const wheelbase = 2.0;
+                        const estimatedRampAngle = Math.atan2(heightDiff, wheelbase);
+                        // Add upward velocity component based on forward speed and ramp angle (reduced to 1/3)
+                        const upwardVelocity = forwardSpeed * Math.sin(estimatedRampAngle) * (0.5 / 3);
+                        car.userData.velocity.y = Math.max(car.userData.velocity.y, upwardVelocity);
+                    } else {
+                        // Wheels are airborne (not near blocks) - no boost
+                        car.userData.velocity.y = 0;
+                    }
+                } else {
+                    // Flat ground - reset vertical velocity
+                    car.userData.velocity.y = 0;
+                }
+                
+                // Smoothly interpolate to target wheel height (prevents bouncing at high speeds)
+                // On ramps, use slower smoothing to prevent shaking/jitter when car is tilted
+                if (isOnRamp) {
+                    // Slower smoothing on ramps to prevent jitter when car is tilted
+                    const smoothingSpeed = Math.min(8.0, 3.0 + forwardSpeed * 0.3);
+                    car.userData.smoothedY = THREE.MathUtils.lerp(car.userData.smoothedY, avgY, delta * smoothingSpeed);
+                } else {
+                    // Faster smoothing on flat ground
+                    const smoothingSpeed = Math.min(15.0, 5.0 + forwardSpeed * 0.5);
+                    car.userData.smoothedY = THREE.MathUtils.lerp(car.userData.smoothedY, avgY, delta * smoothingSpeed);
+                }
+                car.position.y = car.userData.smoothedY;
+            }
+            
+            // Now update wheel local Y positions based on new car Y position
+            // Wheels are now children of body (body center at y=0.6 relative to carGroup)
+            // So wheel local Y is relative to body center, not carGroup center
+            // Reduced suspension - wheels can extend less below car body
+            // Also limit how far wheels can extend upward into car body
+            // Smooth wheel positions to prevent bouncing at high speeds
+            const bodyCenterOffset = 0.6; // Body center is at y=0.6 relative to carGroup
+            const minWheelLocalY = -0.15 - bodyCenterOffset; // Reduced suspension - account for body center offset
+            const maxWheelLocalY = 0.1 - bodyCenterOffset; // Maximum wheel local Y - account for body center offset
+            // This prevents wheels from lifting too much into the car body when hitting blocks
+            const wheelSmoothingSpeed = Math.min(20.0, 8.0 + forwardSpeed * 0.6); // Adaptive wheel smoothing
+            wheels.forEach((wheelGroup) => {
+                if (wheelGroup.userData.targetWorldY !== undefined) {
+                    // Wheel world Y = car.position.y + bodyCenterOffset + wheelLocalY
+                    // So wheelLocalY = targetWorldY - car.position.y - bodyCenterOffset
+                    const targetWheelLocalY = wheelGroup.userData.targetWorldY - car.position.y - bodyCenterOffset;
+                    // Clamp to both min and max to prevent wheels from going too high into car body
+                    const clampedTargetY = Math.max(minWheelLocalY, Math.min(targetWheelLocalY, maxWheelLocalY));
+                    
+                    // Initialize smoothed position if not exists
+                    if (wheelGroup.userData.smoothedLocalY === undefined) {
+                        wheelGroup.userData.smoothedLocalY = clampedTargetY;
+                    }
+                    
+                    // Smoothly interpolate wheel position
+                    wheelGroup.userData.smoothedLocalY = THREE.MathUtils.lerp(
+                        wheelGroup.userData.smoothedLocalY, 
+                        clampedTargetY, 
+                        delta * wheelSmoothingSpeed
+                    );
+                    wheelGroup.position.y = wheelGroup.userData.smoothedLocalY;
+                }
+            });
+        }
+        
+        // Calculate car rotation based on wheel height differences (tilting)
+        // Now works with single wheels touching blocks (not just both wheels of a side)
+        if (wheelCount === 4) {
+            // Initialize angular velocities if not exists (for maintaining rotation when airborne)
+            if (car.userData.angularVelocity === undefined) {
+                car.userData.angularVelocity = { pitch: 0, roll: 0 };
+            }
+            
+            // Use wheels array directly - order is: [0]=frontLeft, [1]=frontRight, [2]=backLeft, [3]=backRight
+            const frontLeftY = wheels[0].userData.targetWorldY;
+            const frontRightY = wheels[1].userData.targetWorldY;
+            const backLeftY = wheels[2].userData.targetWorldY;
+            const backRightY = wheels[3].userData.targetWorldY;
+            
+            if (frontLeftY !== undefined && frontRightY !== undefined && backLeftY !== undefined && backRightY !== undefined) {
+                const wheelbase = 2.0;
+                const trackWidth = 2.0;
+                const blockThreshold = 0.1; // Consider on block if height > ground + wheel radius + threshold
+                
+                // Initialize previous airborne state tracking
+                if (car.userData.wasAirborne === undefined) {
+                    car.userData.wasAirborne = false;
+                }
+                
+                // Recalculate if airborne for this section (check if car bottom is above lowest wheel target)
+                const carBottomOffset = 0.5;
+                const carBottomY = car.position.y - carBottomOffset;
+                // Safely calculate lowest wheel target (handle potential undefined values)
+                const wheelHeights = [frontLeftY, frontRightY, backLeftY, backRightY].filter(y => y !== undefined);
+                const lowestWheelTarget = wheelHeights.length > 0 ? Math.min(...wheelHeights) : groundY + wheelRadius;
+                const isAirborneNow = carBottomY > lowestWheelTarget + 0.15;
+                
+                // Calculate averages for pitch and roll (works with single wheels too)
+                const frontAvgY = (frontLeftY + frontRightY) / 2;
+                const backAvgY = (backLeftY + backRightY) / 2;
+                const leftAvgY = (frontLeftY + backLeftY) / 2;
+                const rightAvgY = (frontRightY + backRightY) / 2;
+                
+                // Calculate target pitch based on front-back difference (single wheels work too)
+                const pitchDiff = frontAvgY - backAvgY;
+                let targetPitchX = -pitchDiff / wheelbase; // Negative sign for correct pitch direction
+                
+                // Calculate target roll based on left-right difference (single wheels work too)
+                const rollDiff = leftAvgY - rightAvgY;
+                let targetRollZ = -rollDiff / trackWidth;
+                
+                // Check if just became airborne (transition from ground to air)
+                const justBecameAirborne = !car.userData.wasAirborne && isAirborneNow;
+                
+                // If airborne, apply angular velocity to maintain rotation
+                if (isAirborneNow) {
+                    // If just became airborne, set initial angular velocity based on current tilt state
+                    if (justBecameAirborne) {
+                        const bodyMesh = car.userData.bodyMesh;
+                        const currentPitch = bodyMesh ? (bodyMesh.rotation.x || 0) : 0;
+                        const currentRoll = car.rotation.z || 0;
+                        
+                        // Calculate angular velocity based on wheel height differences (no scaling limits)
+                        // This creates rotational force based on which wheels were last touching
+                        const forwardSpeed = Math.sqrt(car.userData.velocity.x ** 2 + car.userData.velocity.z ** 2);
+                        // Reduced angular velocity multiplier for more realistic rotation (was 2.0 + speed*0.3)
+                        // Real cars don't rotate that fast when jumping
+                        const angularVelocityMultiplier = 0.8 + forwardSpeed * 0.15; // Much slower, more realistic rotation
+                        car.userData.angularVelocity.pitch = targetPitchX * angularVelocityMultiplier;
+                        car.userData.angularVelocity.roll = targetRollZ * angularVelocityMultiplier;
+                    }
+                    
+                    // Continue rotating based on angular velocity (no limits on rotation)
+                    const bodyMesh = car.userData.bodyMesh;
+                    if (bodyMesh) {
+                        const currentPitch = bodyMesh.rotation.x || 0;
+                        // Apply angular velocity to pitch (no limits)
+                        bodyMesh.rotation.x = currentPitch + car.userData.angularVelocity.pitch * delta;
+                        // Dampen angular velocity over time (air resistance)
+                        car.userData.angularVelocity.pitch *= (1 - delta * 1.5); // Slower damping
+                    }
+                    // Apply angular velocity to roll (no limits)
+                    const currentRoll = car.rotation.z || 0;
+                    car.rotation.z = currentRoll + car.userData.angularVelocity.roll * delta;
+                    // Dampen angular velocity over time (air resistance)
+                    car.userData.angularVelocity.roll *= (1 - delta * 1.5); // Slower damping
+                } else {
+                    // On ground - calculate tilt based on wheel heights (no scaling limits)
+                    // Use adaptive smoothing based on speed (faster smoothing at high speeds)
+                    const forwardSpeed = Math.sqrt(car.userData.velocity.x ** 2 + car.userData.velocity.z ** 2);
+                    const rotationSmoothing = Math.min(12.0, 4.0 + forwardSpeed * 0.4); // Adaptive smoothing
+                    
+                    // Update angular velocity based on current tilt (no limits on target angles)
+                    const bodyMesh = car.userData.bodyMesh;
+                    if (bodyMesh) {
+                        const currentPitch = bodyMesh.rotation.x || 0;
+                        const pitchError = targetPitchX - currentPitch;
+                        // Angular velocity pushes toward target (no limits)
+                        car.userData.angularVelocity.pitch = pitchError * Math.min(4.0, 2.0 + forwardSpeed * 0.15);
+                        bodyMesh.rotation.x = THREE.MathUtils.lerp(currentPitch, targetPitchX, delta * rotationSmoothing);
+                    }
+                    
+                    const currentRoll = car.rotation.z || 0;
+                    const rollError = targetRollZ - currentRoll;
+                    // Angular velocity pushes toward target (no limits)
+                    car.userData.angularVelocity.roll = rollError * Math.min(4.0, 2.0 + forwardSpeed * 0.15);
+                    car.rotation.z = THREE.MathUtils.lerp(currentRoll, targetRollZ, delta * rotationSmoothing);
+                }
+                
+                // Update previous airborne state for next frame
+                car.userData.wasAirborne = isAirborneNow;
+            }
+        }
+    }
+    
+    // Disable collision detection - wheels handle all block climbing via suspension
+    // Only wheels detect blocks and lift the car accordingly
+    
+    // Update player position if in car
+    if (currentCar === car && localPlayer) {
+        // Ensure player is invisible while in car
+        localPlayer.visible = false;
+        
+        const seatPos = car.userData.seatPositions[carSeatIndex];
+        if (seatPos) {
+            const worldSeatPos = new THREE.Vector3(seatPos.x, seatPos.y, seatPos.z);
+            worldSeatPos.applyMatrix4(car.matrixWorld);
+            localPlayer.position.copy(worldSeatPos);
+            localPlayer.position.y -= 0.9; // Adjust for player height
+            
+            // Rotate player to match car (if driver)
+            if (carSeatIndex === 0) {
+                localPlayer.rotation.y = car.rotation.y;
+            }
+            
+            // Sync player position to server (player is in car)
+            const now = performance.now();
+            if (socket && (!car.userData.lastPlayerSyncTime || (now - car.userData.lastPlayerSyncTime) > 0.1)) {
+                socket.emit('playerMove', {
+                    position: {
+                        x: localPlayer.position.x,
+                        y: localPlayer.position.y,
+                        z: localPlayer.position.z
+                    },
+                    rotation: {
+                        x: localPlayer.rotation.x,
+                        y: localPlayer.rotation.y,
+                        z: localPlayer.rotation.z
+                    },
+                    headRotation: {
+                        x: localPlayer.userData.head ? localPlayer.userData.head.rotation.x : 0,
+                        y: localPlayer.userData.head ? localPlayer.userData.head.rotation.y : 0,
+                        z: localPlayer.userData.head ? localPlayer.userData.head.rotation.z : 0
+                    },
+                    isSprinting: false
+                });
+                car.userData.lastPlayerSyncTime = now;
+            }
+        }
+    }
+    
+    // Sync car position to server (if player is driving or owns the car)
+    if (socket && car.userData.carId && (currentCar === car || car.userData.ownerId === socket.id)) {
+        const now = performance.now();
+        if (!car.userData.lastSyncTime || (now - car.userData.lastSyncTime) > 0.05) {
+            socket.emit('carUpdate', {
+                carId: car.userData.carId,
+                position: {
+                    x: car.position.x,
+                    y: car.position.y,
+                    z: car.position.z
+                },
+                rotation: {
+                    x: car.rotation.x,
+                    y: car.rotation.y,
+                    z: car.rotation.z
+                }
+            });
+            car.userData.lastSyncTime = now;
+        }
+    }
+}
+
+// Enter car
+function enterCar(car, seatIndex) {
+    if (!car || !localPlayer || seatIndex < 0 || seatIndex > 3) return;
+    if (car.userData.seats[seatIndex] !== null) return; // Seat occupied
+    
+    currentCar = car;
+    carSeatIndex = seatIndex;
+    car.userData.seats[seatIndex] = localPlayer;
+    
+    // Sync to server
+    if (socket && car.userData.carId) {
+        socket.emit('carEntry', {
+            carId: car.userData.carId,
+            seatIndex: seatIndex
+        });
+    }
+    
+    // Hide player model when in car
+    localPlayer.visible = false;
+}
+
+// Exit car
+function exitCar() {
+    if (!currentCar || !localPlayer) return;
+    
+    const carId = currentCar.userData.carId;
+    
+    // Sync to server
+    if (socket && carId) {
+        socket.emit('carExit', {
+            carId: carId
+        });
+    }
+    
+    // Remove player from seat
+    if (carSeatIndex >= 0 && carSeatIndex < 4) {
+        currentCar.userData.seats[carSeatIndex] = null;
+    }
+    
+    // Position player next to car
+    const exitOffset = new THREE.Vector3(1.5, 0, 0);
+    exitOffset.applyMatrix4(currentCar.matrixWorld);
+    exitOffset.sub(currentCar.position);
+    localPlayer.position.add(exitOffset);
+    localPlayer.position.y = currentCar.position.y;
+    
+    // Make player visible again
+    localPlayer.visible = true;
+    
+    currentCar = null;
+    carSeatIndex = -1;
+    // Don't reset global steering/acceleration - they're per-car now
+}
+
 function animate() {
     requestAnimationFrame(animate);
 
@@ -5205,8 +6435,15 @@ function animate() {
     // This fixes the issue where inactive tabs cause noclip and position desync
     delta = Math.min(delta, 0.1);
 
-    // Update player movement
-    updatePlayerMovement(delta);
+    // Update cars
+    cars.forEach((car) => {
+        updateCar(car, delta);
+    });
+
+    // Update player movement (only if not in car)
+    if (!currentCar) {
+        updatePlayerMovement(delta);
+    }
 
     // Update camera
     updateCamera();
@@ -5222,6 +6459,33 @@ function animate() {
         updateNameLabelPosition(localPlayer);
     }
     otherPlayers.forEach(player => {
+        // Update player position if in car
+        if (player.userData.inCar && player.userData.carSeatIndex !== null && player.userData.carSeatIndex !== undefined) {
+            const car = cars.get(player.userData.inCar);
+            if (car && car.userData.seatPositions) {
+                // Ensure player is invisible while in car (prevent phasing through)
+                player.visible = false;
+                
+                const seatPos = car.userData.seatPositions[player.userData.carSeatIndex];
+                if (seatPos) {
+                    const worldSeatPos = new THREE.Vector3(seatPos.x, seatPos.y, seatPos.z);
+                    worldSeatPos.applyMatrix4(car.matrixWorld);
+                    player.position.copy(worldSeatPos);
+                    player.position.y -= 0.9; // Adjust for player height
+                    
+                    // Rotate player to match car (if driver)
+                    if (player.userData.carSeatIndex === 0) {
+                        player.rotation.y = car.rotation.y;
+                    }
+                }
+            }
+        } else if (player.userData.inCar === null || player.userData.inCar === undefined) {
+            // Make sure player is visible when not in car (unless ragdoll)
+            if (!player.visible && !player.userData.ragdoll) {
+                player.visible = true;
+            }
+        }
+        
         animateStickman(player, delta);
         updateSpeechBubblePosition(player);
         updateNameLabelPosition(player);

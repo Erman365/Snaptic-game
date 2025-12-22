@@ -23,6 +23,7 @@ const PORT = process.env.PORT || 3000;
 // Game state
 const players = new Map();
 const blocks = new Map();
+const cars = new Map(); // Track all cars
 
 // Helper function to generate unique ID
 function generateId() {
@@ -67,7 +68,8 @@ io.on('connection', (socket) => {
                     ...p,
                     equippedItem: p.equippedItem || null
                 })),
-                blocks: Array.from(blocks.entries()).map(([key, value]) => ({ key, ...value }))
+                blocks: Array.from(blocks.entries()).map(([key, value]) => ({ key, ...value })),
+                cars: Array.from(cars.values())
             });
 
             // Broadcast new player to others
@@ -144,8 +146,16 @@ io.on('connection', (socket) => {
             } else if (data.type === 'sign') {
                 block.message = data.message || '';
             }
-            // Broadcast update to all clients
-            io.emit('blockUpdated', { key: blockKey, ...block });
+            // Broadcast update to all clients (including x, y, z for compatibility)
+            io.emit('blockUpdated', { 
+                key: blockKey, 
+                x: block.x, 
+                y: block.y, 
+                z: block.z,
+                type: data.type,
+                isOpen: data.type === 'door' ? block.isOpen : undefined,
+                message: data.type === 'sign' ? block.message : undefined
+            });
         }
     });
 
@@ -299,6 +309,66 @@ io.on('connection', (socket) => {
             socket.broadcast.emit('playerEquippedItem', {
                 playerId: playerId,
                 item: data.item
+            });
+        }
+    });
+    
+    // Handle car spawn
+    socket.on('carSpawned', (data) => {
+        const carData = {
+            carId: data.carId,
+            position: data.position,
+            rotation: data.rotation,
+            ownerId: playerId,
+            seats: [null, null, null, null]
+        };
+        cars.set(data.carId, carData);
+        socket.broadcast.emit('carSpawned', carData);
+    });
+    
+    // Handle car update (position/rotation)
+    socket.on('carUpdate', (data) => {
+        const car = cars.get(data.carId);
+        if (car) {
+            car.position = data.position;
+            car.rotation = data.rotation;
+            socket.broadcast.emit('carUpdated', {
+                carId: data.carId,
+                position: data.position,
+                rotation: data.rotation
+            });
+        }
+    });
+    
+    // Handle player entering car
+    socket.on('carEntry', (data) => {
+        const car = cars.get(data.carId);
+        const player = players.get(playerId);
+        if (car && player && data.seatIndex >= 0 && data.seatIndex < 4) {
+            car.seats[data.seatIndex] = playerId;
+            player.inCar = data.carId;
+            player.carSeatIndex = data.seatIndex;
+            socket.broadcast.emit('playerEnteredCar', {
+                playerId: playerId,
+                carId: data.carId,
+                seatIndex: data.seatIndex
+            });
+        }
+    });
+    
+    // Handle player exiting car
+    socket.on('carExit', (data) => {
+        const car = cars.get(data.carId);
+        const player = players.get(playerId);
+        if (car && player && player.inCar === data.carId) {
+            if (car.seats[player.carSeatIndex] === playerId) {
+                car.seats[player.carSeatIndex] = null;
+            }
+            player.inCar = null;
+            player.carSeatIndex = null;
+            socket.broadcast.emit('playerExitedCar', {
+                playerId: playerId,
+                carId: data.carId
             });
         }
     });
