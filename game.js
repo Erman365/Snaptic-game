@@ -5624,122 +5624,211 @@ function updateCar(car, delta) {
     // Get wheel raycast positions (for suspension)
     const wheels = car.userData.wheels || [];
     
-    // HITBOX COLLISION CHECK: Detect walls BEFORE moving (use current position)
+    // HITBOX COLLISION CHECK: Detect walls in all directions and disable controls (not velocity)
     // Check if car is tilted 35+ degrees (allows wall driving)
     const bodyMesh = car.userData.bodyMesh;
     const carPitch = bodyMesh ? (bodyMesh.rotation.x || 0) : 0;
     const isTiltedBack = carPitch < -0.611; // -35 degrees in radians (negative = tilted back)
     
+    // Initialize blocked directions
+    if (!car.userData.blockedDirections) {
+        car.userData.blockedDirections = { forward: false, backward: false, left: false, right: false };
+    }
+    
     // Store current position for hitbox check
     const currentCarPos = car.position.clone();
     const currentCarY = car.position.y;
     
-    // Only check for walls if NOT already tilted 35+ degrees
-    if (!isTiltedBack) {
-        // Get velocity direction
-        const velocityX = car.userData.velocity.x;
-        const velocityZ = car.userData.velocity.z;
-        const speed = Math.sqrt(velocityX * velocityX + velocityZ * velocityZ);
-        
-        if (speed > 0.1) {
-            // Normalize velocity direction
-            const moveDirX = velocityX / speed;
-            const moveDirZ = velocityZ / speed;
-            
-            // For high-speed collision detection, check multiple points along the movement path
-            // Use smaller step size for better accuracy at high speeds
-            const movementDistance = speed * delta;
-            const maxStepSize = 0.15; // Smaller step size for better detection
-            const numChecks = Math.max(5, Math.ceil(movementDistance / maxStepSize));
-            const stepSize = movementDistance / numChecks;
-            
-            const carWidth = 1.2; // Approximate car width
-            const carHeightMin = currentCarY - 0.6; // Bottom of car
-            const carHeightMax = currentCarY + 1.0; // Top of car (approximate)
-            
-            let hitWall = false;
-            let maxWallHeight = -Infinity;
-            
-            // Check along the movement path from CURRENT position
-            for (let step = 1; step <= numChecks; step++) {
-                const checkDistance = step * stepSize;
-                const checkX = currentCarPos.x + moveDirX * checkDistance;
-                const checkZ = currentCarPos.z + moveDirZ * checkDistance;
-                
-                // Check multiple points across car width at this step
-                const checkPoints = [
-                    { x: checkX, z: checkZ }, // Front center
-                    { x: checkX + moveDirZ * carWidth * 0.5, z: checkZ - moveDirX * carWidth * 0.5 }, // Front right
-                    { x: checkX - moveDirZ * carWidth * 0.5, z: checkZ + moveDirX * carWidth * 0.5 }, // Front left
-                ];
-                
-                checkPoints.forEach(checkPoint => {
-                    const blockGridX = Math.round(checkPoint.x);
-                    const blockGridZ = Math.round(checkPoint.z);
-                    
-                    // Check all blocks
-                    blocks.forEach((block) => {
-                        const blockPos = block.position;
-                        const blockGridXBlock = Math.round(blockPos.x);
-                        const blockGridZBlock = Math.round(blockPos.z);
-                        
-                        // Check if block is in the path
-                        if (blockGridX === blockGridXBlock && blockGridZ === blockGridZBlock) {
-                            const gridY = block.userData.gridY !== undefined ? block.userData.gridY : Math.round(blockPos.y - 0.5);
-                            const blockBottom = gridY;
-                            const blockTop = gridY + 1;
-                            
-                            // Only check blocks that are at the car's height level (not platforms above)
-                            // Block must overlap with car's vertical range to be considered a wall
-                            if (blockBottom <= carHeightMax && blockTop >= carHeightMin) {
-                                // Count wall height at this X,Z position (check all blocks stacked here)
-                                let wallHeight = 0;
-                                let minWallY = Infinity;
-                                let maxWallY = -Infinity;
-                                
-                                blocks.forEach(checkBlock => {
-                                    const checkBlockPos = checkBlock.position;
-                                    const checkBlockGridX = Math.round(checkBlockPos.x);
-                                    const checkBlockGridZ = Math.round(checkBlockPos.z);
-                                    const checkBlockGridY = checkBlock.userData.gridY !== undefined ? 
-                                        checkBlock.userData.gridY : Math.round(checkBlockPos.y - 0.5);
-                                    
-                                    if (blockGridX === checkBlockGridX && blockGridZ === checkBlockGridZ) {
-                                        // Same X,Z position - count as part of wall
-                                        if (checkBlockGridY < minWallY) minWallY = checkBlockGridY;
-                                        if (checkBlockGridY > maxWallY) maxWallY = checkBlockGridY;
-                                        wallHeight = maxWallY - minWallY + 1;
-                                    }
-                                });
-                                
-                                // If wall is 2+ blocks high, it's a collision
-                                if (wallHeight >= 2) {
-                                    hitWall = true;
-                                    if (gridY > maxWallHeight) {
-                                        maxWallHeight = gridY;
-                                    }
-                                }
-                            }
-                        }
-                    });
-                });
-                
-                // If we hit a wall, stop checking further along the path
-                if (hitWall && maxWallHeight >= 1) {
-                    break;
-                }
+    // Update matrix to ensure wheel positions are current for wall checking
+    car.updateMatrixWorld(true);
+    
+    // Check if car is on a ramp (wheels at different heights) - disable wall blocking on ramps
+    // Use previous frame's wheel heights if available, or check current wheel world positions
+    let isOnRampForBlocking = false;
+    if (wheels.length >= 4) {
+        const wheelHeights = [];
+        wheels.forEach((wheelGroup) => {
+            // Try to use targetWorldY from previous frame first, otherwise use current world position
+            if (wheelGroup.userData.targetWorldY !== undefined) {
+                wheelHeights.push(wheelGroup.userData.targetWorldY);
+            } else {
+                // Fallback: use current world position
+                const wheelWorldPos = new THREE.Vector3();
+                wheelGroup.getWorldPosition(wheelWorldPos);
+                wheelHeights.push(wheelWorldPos.y);
             }
-            
-            // If wall is 2+ blocks high, stop the car immediately
-            if (hitWall && maxWallHeight >= 1) {
-                // Stop velocity completely when hitting a wall
-                car.userData.velocity.x = 0;
-                car.userData.velocity.z = 0;
-            }
+        });
+        if (wheelHeights.length >= 4) {
+            const minWheelY = Math.min(...wheelHeights);
+            const maxWheelY = Math.max(...wheelHeights);
+            const heightDiff = maxWheelY - minWheelY;
+            // If wheels are at significantly different heights, car is on a ramp
+            isOnRampForBlocking = heightDiff > 0.1;
         }
     }
     
-    // Calculate new position (after hitbox check) to detect blocks at future position
+    // Only check for walls if NOT tilted 35+ degrees AND NOT on a ramp (wheels at same level)
+    if (!isTiltedBack && !isOnRampForBlocking) {
+        // Check all 4 directions (forward, backward, left, right) relative to car rotation
+        const forwardX = Math.sin(car.rotation.y);
+        const forwardZ = Math.cos(car.rotation.y);
+        const rightX = forwardZ; // Perpendicular to forward
+        const rightZ = -forwardX;
+        
+        // Check further ahead and wider area to catch walls better
+        const checkDistance = 1.2; // Increased distance to check ahead
+        const carWidth = 1.5; // Car width
+        const carHeightMin = currentCarY - 0.6;
+        const carHeightMax = currentCarY + 1.0;
+        
+        // Check each direction
+        const directions = [
+            { name: 'forward', dirX: forwardX, dirZ: forwardZ },
+            { name: 'backward', dirX: -forwardX, dirZ: -forwardZ },
+            { name: 'right', dirX: rightX, dirZ: rightZ },
+            { name: 'left', dirX: -rightX, dirZ: -rightZ }
+        ];
+        
+        // Reset all blocked directions first
+        car.userData.blockedDirections.forward = false;
+        car.userData.blockedDirections.backward = false;
+        car.userData.blockedDirections.left = false;
+        car.userData.blockedDirections.right = false;
+        
+        directions.forEach(direction => {
+            // Check multiple points across the car's width to catch walls better
+            const checkPoints = [
+                { x: 0, z: 0 }, // Center
+                { x: rightX * carWidth * 0.5, z: rightZ * carWidth * 0.5 }, // Right side
+                { x: -rightX * carWidth * 0.5, z: -rightZ * carWidth * 0.5 } // Left side
+            ];
+            
+            let wallDetected = false;
+            const detectedWallBlocks = []; // Store blocks that form the detected wall
+            
+            checkPoints.forEach(point => {
+                if (wallDetected) return; // Skip if already detected wall
+                
+                const checkX = currentCarPos.x + direction.dirX * checkDistance + point.x;
+                const checkZ = currentCarPos.z + direction.dirZ * checkDistance + point.z;
+                
+                // Check all grid cells near this point (2x2 area)
+                for (let offsetX = -1; offsetX <= 0; offsetX++) {
+                    for (let offsetZ = -1; offsetZ <= 0; offsetZ++) {
+                        const blockGridX = Math.round(checkX) + offsetX;
+                        const blockGridZ = Math.round(checkZ) + offsetZ;
+                        
+                        // Check all blocks at this grid position
+                        blocks.forEach((block) => {
+                            if (wallDetected) return; // Skip if already detected
+                            
+                            const blockPos = block.position;
+                            const blockGridXBlock = Math.round(blockPos.x);
+                            const blockGridZBlock = Math.round(blockPos.z);
+                            
+                            if (blockGridX === blockGridXBlock && blockGridZ === blockGridZBlock) {
+                                const gridY = block.userData.gridY !== undefined ? block.userData.gridY : Math.round(blockPos.y - 0.5);
+                                const blockBottom = gridY;
+                                const blockTop = gridY + 1;
+                                
+                                // Only check blocks at car's height level
+                                if (blockBottom <= carHeightMax && blockTop >= carHeightMin) {
+                                    // Count wall height at this X,Z position and collect all blocks in the wall
+                                    let wallHeight = 0;
+                                    let minWallY = Infinity;
+                                    let maxWallY = -Infinity;
+                                    const wallBlocksAtPos = []; // Blocks at this X,Z position
+                                    
+                                    blocks.forEach(checkBlock => {
+                                        const checkBlockPos = checkBlock.position;
+                                        const checkBlockGridX = Math.round(checkBlockPos.x);
+                                        const checkBlockGridZ = Math.round(checkBlockPos.z);
+                                        const checkBlockGridY = checkBlock.userData.gridY !== undefined ? 
+                                            checkBlock.userData.gridY : Math.round(checkBlockPos.y - 0.5);
+                                        
+                                        if (blockGridX === checkBlockGridX && blockGridZ === checkBlockGridZ) {
+                                            wallBlocksAtPos.push({ block: checkBlock, gridY: checkBlockGridY });
+                                            if (checkBlockGridY < minWallY) minWallY = checkBlockGridY;
+                                            if (checkBlockGridY > maxWallY) maxWallY = checkBlockGridY;
+                                            wallHeight = maxWallY - minWallY + 1;
+                                        }
+                                    });
+                                    
+                                    // If wall is 2+ blocks high, check if wheels are already on it or car is ascending
+                                    if (wallHeight >= 2) {
+                                        // Check if front wheels (for forward) or rear wheels (for backward) are on these wall blocks
+                                        let wheelsOnWall = false;
+                                        const wheelRadius = 0.6;
+                                        
+                                        // Also check if car is currently ascending (climbing) - indicates it's on a ramp
+                                        // Check vertical velocity, ramp state, or if car is tilted (pitch angle indicates climbing)
+                                        const carIsTilted = Math.abs(carPitch) > 0.2; // Car is tilted (on a slope)
+                                        const isAscending = car.userData.velocity.y > 0.1 || isOnRampForBlocking || carIsTilted;
+                                        
+                                        // Determine which wheels to check based on direction
+                                        let wheelsToCheck = [];
+                                        if (direction.name === 'forward') {
+                                            // Check front wheels (indices 0, 1)
+                                            wheelsToCheck = wheels.slice(0, Math.min(2, wheels.length));
+                                        } else if (direction.name === 'backward') {
+                                            // Check rear wheels (indices 2, 3)
+                                            wheelsToCheck = wheels.slice(2, Math.min(4, wheels.length));
+                                        }
+                                        
+                                        // Check each relevant wheel
+                                        wheelsToCheck.forEach(wheelGroup => {
+                                            const wheelWorldPos = new THREE.Vector3();
+                                            wheelGroup.getWorldPosition(wheelWorldPos);
+                                            const wheelGridX = Math.round(wheelWorldPos.x);
+                                            const wheelGridZ = Math.round(wheelWorldPos.z);
+                                            
+                                            // Check if wheel is at the same grid position as the wall
+                                            if (wheelGridX === blockGridX && wheelGridZ === blockGridZ) {
+                                                // Wheel is at this position, check if it's sitting on one of the wall blocks
+                                                // Use targetWorldY from previous frame if available, otherwise current Y
+                                                const wheelY = wheelGroup.userData.targetWorldY !== undefined ? 
+                                                    wheelGroup.userData.targetWorldY : wheelWorldPos.y;
+                                                const wheelBottom = wheelY - wheelRadius;
+                                                
+                                                // Check all blocks in the wall at this position
+                                                wallBlocksAtPos.forEach(({ block: wallBlock, gridY: wallGridY }) => {
+                                                    const blockTop = wallGridY + 1;
+                                                    // Check if wheel bottom is on or very close to the block top (within 0.3 units)
+                                                    if (wheelBottom >= blockTop - 0.3 && wheelBottom <= blockTop + 0.3) {
+                                                        wheelsOnWall = true;
+                                                    }
+                                                });
+                                            }
+                                        });
+                                        
+                                        // Don't block if:
+                                        // 1. Wheels are already on the wall, OR
+                                        // 2. Car is ascending (climbing a ramp) - allows continuing up ramp even at the end
+                                        if (!wheelsOnWall && !isAscending) {
+                                            wallDetected = true;
+                                            car.userData.blockedDirections[direction.name] = true;
+                                        }
+                                    }
+                                }
+                            }
+                        });
+                    }
+                }
+            });
+        });
+    } else {
+        // Car is tilted 35+ degrees or on a ramp - clear all blocked directions (allow movement)
+        car.userData.blockedDirections.forward = false;
+        car.userData.blockedDirections.backward = false;
+        car.userData.blockedDirections.left = false;
+        car.userData.blockedDirections.right = false;
+    }
+    
+    // REMOVED: Continuous collision detection - rely entirely on wheel physics
+    // Wheel physics naturally handle ramps and prevent phasing through blocks
+    // The hitbox check (earlier in code) handles wall blocking via controls
+    
+    // Calculate new position - wheel physics will handle collision naturally
     const newCarPos = car.position.clone();
     newCarPos.x += car.userData.velocity.x * delta;
     newCarPos.z += car.userData.velocity.z * delta;
@@ -5755,9 +5844,6 @@ function updateCar(car, delta) {
     // Update matrix to ensure world positions are calculated correctly
     car.updateMatrixWorld(true);
     
-    // Car's current vertical range - only check blocks within this range
-    const carBottomY = car.position.y - 0.6; // Bottom of car
-    const carTopY = car.position.y + 1.0; // Top of car (approximate)
     const maxWheelClimb = 1.2; // Maximum height a wheel can climb in one frame
     
     wheels.forEach((wheelGroup, index) => {
@@ -5771,41 +5857,51 @@ function updateCar(car, delta) {
             wheelGroup.userData.targetWorldY : worldWheelPos.y;
         
         // Find the highest valid surface (ground or block top) at this X,Z position
-        // Only check blocks within car's vertical range to prevent detecting platforms above
+        // Check blocks relative to wheel position, not car position, to detect elevated blocks
         let highestSurface = groundY;
         const blocksToCheck = Array.from(blocks.values());
         
-        // Check multiple sample points on the wheel (center + 4 points around it)
-        const samplePoints = [
-            { x: 0, z: 0 },           // Center
-            { x: wheelRadius * 0.7, z: 0 },           // Right
-            { x: -wheelRadius * 0.7, z: 0 },          // Left
-            { x: 0, z: wheelRadius * 0.7 },          // Forward
-            { x: 0, z: -wheelRadius * 0.7 }           // Backward
-        ];
+        // Use vertical range relative to wheel's current/expected position
+        // Check from well below to slightly above the wheel to catch elevated blocks
+        // IMPORTANT: Check well below to ensure platform blocks are always detected even when encountering ramps/blocks on top
+        // Check up to maxWheelClimb above current position (allows climbing)
+        const wheelCheckBottom = Math.min(currentWheelY - 5.0, groundY - 0.5); // Check at least 5 blocks below, or down to ground
+        const wheelCheckTop = currentWheelY + maxWheelClimb + 0.5; // Check slightly above max climb range
         
-        samplePoints.forEach(sample => {
-            const checkX = worldWheelPos.x + sample.x;
-            const checkZ = worldWheelPos.z + sample.z;
-            
-            blocksToCheck.forEach(block => {
-                const blockPos = block.position;
-                const gridY = block.userData.gridY !== undefined ? block.userData.gridY : Math.round(blockPos.y - 0.5);
-                const blockTop = gridY + 1;
-                const blockBottom = gridY;
+        // Use grid-based detection instead of sample points - more reliable for diagonal ramps
+        // Check all blocks in a grid area around the wheel (like ground plane detection)
+        const wheelGridX = Math.round(worldWheelPos.x);
+        const wheelGridZ = Math.round(worldWheelPos.z);
+        const checkRadius = 1; // Check 1 block in each direction (3x3 grid = 9 blocks total)
+        
+        // Check blocks in a grid pattern around the wheel (prevents gaps in diagonal ramps)
+        // Also ensures platform blocks are always detected even when encountering ramps/blocks on top
+        for (let offsetX = -checkRadius; offsetX <= checkRadius; offsetX++) {
+            for (let offsetZ = -checkRadius; offsetZ <= checkRadius; offsetZ++) {
+                const checkGridX = wheelGridX + offsetX;
+                const checkGridZ = wheelGridZ + offsetZ;
                 
-                // Use a reasonable detection radius (0.4)
-                const detectionRadius = 0.4;
-                
-                // Check if this sample point is within the block's detection area
-                const dx = checkX - blockPos.x;
-                const dz = checkZ - blockPos.z;
-                const distanceSq = dx * dx + dz * dz;
-                const detectionRadiusSq = detectionRadius * detectionRadius;
-                
-                if (distanceSq <= detectionRadiusSq) {
-                    // Only check blocks that overlap with car's vertical range (not platforms above)
-                    if (blockBottom <= carTopY && blockTop >= carBottomY) {
+                // For each grid position, check all blocks at that X,Z (no horizontal distance restriction)
+                // If a block is in the grid cell, we should consider it - this ensures platform blocks are always found
+                blocksToCheck.forEach(block => {
+                    const blockPos = block.position;
+                    const blockGridX = Math.round(blockPos.x);
+                    const blockGridZ = Math.round(blockPos.z);
+                    
+                    // Check if this block is at the grid position we're checking
+                    if (blockGridX !== checkGridX || blockGridZ !== checkGridZ) {
+                        return; // Skip blocks not at this grid position
+                    }
+                    
+                    const gridY = block.userData.gridY !== undefined ? block.userData.gridY : Math.round(blockPos.y - 0.5);
+                    const blockTop = gridY + 1;
+                    const blockBottom = gridY;
+                    
+                    // Check blocks relative to wheel's position (wider range to detect elevated blocks)
+                    // Only check blocks that are near the wheel vertically (not far above or below)
+                    // Remove horizontal distance restriction - if block is in the grid cell, check it
+                    // This ensures platform blocks are always detected even when wheels encounter ramps/blocks on top
+                    if (blockBottom <= wheelCheckTop && blockTop >= wheelCheckBottom) {
                         // Check if this is a wall (2+ blocks high) - count blocks at this X,Z position
                         if (!isTiltedBack) {
                             // Count how many blocks are stacked at this X,Z position
@@ -5820,8 +5916,7 @@ function updateCar(car, delta) {
                                 const checkBlockGridY = checkBlock.userData.gridY !== undefined ? 
                                     checkBlock.userData.gridY : Math.round(checkBlockPos.y - 0.5);
                                 
-                                if (Math.round(blockPos.x) === checkBlockGridX && 
-                                    Math.round(blockPos.z) === checkBlockGridZ) {
+                                if (blockGridX === checkBlockGridX && blockGridZ === checkBlockGridZ) {
                                     // Same X,Z position - count as part of wall
                                     if (checkBlockGridY < minWallY) minWallY = checkBlockGridY;
                                     if (checkBlockGridY > maxWallY) maxWallY = checkBlockGridY;
@@ -5831,19 +5926,19 @@ function updateCar(car, delta) {
                             
                             // If wall is 2+ blocks high, don't allow wheel to climb it
                             if (wallHeight >= 2) {
-                                // Skip this block - don't allow climbing
-                                return;
+                                return; // Skip this block - don't allow climbing
                             }
                         }
                         
                         // This is a valid block surface - use the block top as surface
+                        // IMPORTANT: Always check the highest valid surface, including platform blocks below ramps
                         if (blockTop > highestSurface) {
                             highestSurface = blockTop;
                         }
                     }
-                }
-            });
-        });
+                });
+            }
+        }
         
         // Wheel center should be at surface height + wheel radius
         const targetWheelWorldY = highestSurface + wheelRadius;
@@ -5904,10 +5999,10 @@ function updateCar(car, delta) {
         }
         
         // Uniform acceleration and deceleration (constant rates)
-        const acceleration = 30.0; // Forward acceleration (m/s²)
+        const acceleration = 25.0; // Forward acceleration (m/s²)
         const deceleration = 35.0; // Deceleration when not accelerating (m/s²)
         const braking = 60.0; // Braking when switching directions (m/s²) - faster than normal deceleration
-        const maxSpeed = 40.0; // Maximum speed in units/second (increased from 20)
+        const maxSpeed = 20.0; // Maximum speed in units/second
         const reverseMaxSpeed = maxSpeed * 0.5; // Reverse max speed
         const reverseAcceleration = acceleration * 0.6; // Reverse acceleration
         
@@ -5930,9 +6025,18 @@ function updateCar(car, delta) {
         const isMovingBackward = currentSpeed > 0.1 && dotProduct < -0.3;
         const speedThreshold = 0.5; // Must slow down to this speed before reversing
         
+        // Initialize blocked directions if not exists
+        if (!car.userData.blockedDirections) {
+            car.userData.blockedDirections = { forward: false, backward: false, left: false, right: false };
+        }
+        
         // Only apply controls if car is on the ground (not airborne)
         if (!isAirborneForControls) {
-            if (moveState.forward) {
+            // Check if forward direction is blocked
+            const forwardBlocked = car.userData.blockedDirections.forward;
+            const backwardBlocked = car.userData.blockedDirections.backward;
+            
+            if (moveState.forward && !forwardBlocked) {
                 // If currently moving backward with significant speed, brake first before accelerating forward
                 if (isMovingBackward && currentSpeed > speedThreshold) {
                     // Braking - decelerate faster
@@ -5945,7 +6049,7 @@ function updateCar(car, delta) {
                     car.userData.velocity.x = forwardX * newSpeed;
                     car.userData.velocity.z = forwardZ * newSpeed;
                 }
-            } else if (moveState.backward) {
+            } else if (moveState.backward && !backwardBlocked) {
                 // If currently moving forward with significant speed, brake first before reversing
                 if (isMovingForward && currentSpeed > speedThreshold) {
                     // Braking - decelerate faster
@@ -5969,6 +6073,40 @@ function updateCar(car, delta) {
                     car.userData.velocity.x = 0;
                     car.userData.velocity.z = 0;
                 }
+            }
+            
+            // If trying to move in blocked direction, apply braking and stop velocity in that direction
+            if ((moveState.forward && forwardBlocked) || (moveState.backward && backwardBlocked)) {
+                // Brake when trying to move into a blocked direction
+                if (currentSpeed > 0.01) {
+                    // Check if moving in the blocked direction
+                    const isMovingForward = currentSpeed > 0.1 && dotProduct > 0.3;
+                    const isMovingBackward = currentSpeed > 0.1 && dotProduct < -0.3;
+                    
+                    // If actually moving in the blocked direction, stop immediately
+                    if ((forwardBlocked && isMovingForward) || (backwardBlocked && isMovingBackward)) {
+                        // Stop velocity completely in the blocked direction
+                        car.userData.velocity.x = 0;
+                        car.userData.velocity.z = 0;
+                    } else {
+                        // Otherwise just brake normally
+                        const newSpeed = Math.max(0, currentSpeed - braking * delta);
+                        car.userData.velocity.x = velDir.x * newSpeed;
+                        car.userData.velocity.z = velDir.y * newSpeed;
+                    }
+                }
+            }
+            
+            // Also check if already moving into a blocked direction (even without input)
+            if (forwardBlocked && currentSpeed > 0.1 && dotProduct > 0.3) {
+                // Moving forward into blocked wall - stop immediately
+                car.userData.velocity.x = 0;
+                car.userData.velocity.z = 0;
+            }
+            if (backwardBlocked && currentSpeed > 0.1 && dotProduct < -0.3) {
+                // Moving backward into blocked wall - stop immediately
+                car.userData.velocity.x = 0;
+                car.userData.velocity.z = 0;
             }
         }
         // If airborne, don't apply any controls - car maintains its momentum
@@ -6089,59 +6227,8 @@ function updateCar(car, delta) {
                 const heightDiff = maxWheelY - minWheelY;
                 const isOnRamp = heightDiff > 0.1; // Significant height difference indicates ramp
                 
-                if (isOnRamp && forwardSpeed > 0.5) {
-                    // On a ramp - only add upward velocity if wheels are near blocks (within 1.8 blocks below)
-                    // Check if any wheel is within 1.8 blocks of a block below it
-                    let wheelNearBlock = false;
-                    const maxDistanceBelow = 1.8; // Check 1.8 blocks below wheels
-                    
-                    wheels.forEach((wheelGroup) => {
-                        if (wheelGroup.userData.targetWorldY !== undefined) {
-                            const wheelY = wheelGroup.userData.targetWorldY;
-                            
-                            // Get wheel world X,Z position for block checking
-                            const wheelWorldPos = new THREE.Vector3();
-                            wheelGroup.getWorldPosition(wheelWorldPos);
-                            const wheelGridX = Math.round(wheelWorldPos.x);
-                            const wheelGridZ = Math.round(wheelWorldPos.z);
-                            
-                            // Check if there's a block within maxDistanceBelow below this wheel
-                            blocks.forEach((block) => {
-                                const blockPos = block.position;
-                                const blockGridX = Math.round(blockPos.x);
-                                const blockGridZ = Math.round(blockPos.z);
-                                const blockGridY = block.userData.gridY !== undefined ? 
-                                    block.userData.gridY : Math.round(blockPos.y - 0.5);
-                                
-                                // Check if block is at this wheel's X,Z position
-                                if (blockGridX === wheelGridX && blockGridZ === wheelGridZ) {
-                                    const blockTop = blockGridY + 1;
-                                    const distanceBelow = wheelY - blockTop;
-                                    // Wheel is near block if within maxDistanceBelow below
-                                    if (distanceBelow >= 0 && distanceBelow <= maxDistanceBelow) {
-                                        wheelNearBlock = true;
-                                    }
-                                }
-                            });
-                        }
-                    });
-                    
-                    // Only apply boost if wheels are near blocks (not airborne)
-                    if (wheelNearBlock) {
-                        // Estimate ramp angle from height difference
-                        const wheelbase = 2.0;
-                        const estimatedRampAngle = Math.atan2(heightDiff, wheelbase);
-                        // Add upward velocity component based on forward speed and ramp angle (reduced to 1/3)
-                        const upwardVelocity = forwardSpeed * Math.sin(estimatedRampAngle) * (0.5 / 3);
-                        car.userData.velocity.y = Math.max(car.userData.velocity.y, upwardVelocity);
-                    } else {
-                        // Wheels are airborne (not near blocks) - no boost
-                        car.userData.velocity.y = 0;
-                    }
-                } else {
-                    // Flat ground - reset vertical velocity
-                    car.userData.velocity.y = 0;
-                }
+                // Reset vertical velocity - car climbs ramps naturally through wheel physics (no boost needed)
+                car.userData.velocity.y = 0;
                 
                 // Smoothly interpolate to target wheel height (prevents bouncing at high speeds)
                 // On ramps, use slower smoothing to prevent shaking/jitter when car is tilted
@@ -6277,23 +6364,43 @@ function updateCar(car, delta) {
                     // On ground - calculate tilt based on wheel heights (no scaling limits)
                     // Use adaptive smoothing based on speed (faster smoothing at high speeds)
                     const forwardSpeed = Math.sqrt(car.userData.velocity.x ** 2 + car.userData.velocity.z ** 2);
-                    const rotationSmoothing = Math.min(12.0, 4.0 + forwardSpeed * 0.4); // Adaptive smoothing
                     
-                    // Update angular velocity based on current tilt (no limits on target angles)
-                    const bodyMesh = car.userData.bodyMesh;
-                    if (bodyMesh) {
-                        const currentPitch = bodyMesh.rotation.x || 0;
-                        const pitchError = targetPitchX - currentPitch;
+                    // Check if car is truly stationary (no input AND very low speed)
+                    const isDriver = (currentCar === car && carSeatIndex === 0);
+                    const hasInput = isDriver && (moveState.forward || moveState.backward || moveState.left || moveState.right);
+                    const isTrulyStationary = forwardSpeed < 0.05 && !hasInput;
+                    
+                    // Only apply smoothing/rotation if car is moving or has input
+                    if (!isTrulyStationary) {
+                        const rotationSmoothing = Math.min(12.0, 4.0 + forwardSpeed * 0.4); // Adaptive smoothing
+                        
+                        // Update angular velocity based on current tilt (no limits on target angles)
+                        const bodyMesh = car.userData.bodyMesh;
+                        if (bodyMesh) {
+                            const currentPitch = bodyMesh.rotation.x || 0;
+                            const pitchError = targetPitchX - currentPitch;
+                            // Angular velocity pushes toward target (no limits)
+                            car.userData.angularVelocity.pitch = pitchError * Math.min(4.0, 2.0 + forwardSpeed * 0.15);
+                            bodyMesh.rotation.x = THREE.MathUtils.lerp(currentPitch, targetPitchX, delta * rotationSmoothing);
+                        }
+                        
+                        const currentRoll = car.rotation.z || 0;
+                        const rollError = targetRollZ - currentRoll;
                         // Angular velocity pushes toward target (no limits)
-                        car.userData.angularVelocity.pitch = pitchError * Math.min(4.0, 2.0 + forwardSpeed * 0.15);
-                        bodyMesh.rotation.x = THREE.MathUtils.lerp(currentPitch, targetPitchX, delta * rotationSmoothing);
+                        car.userData.angularVelocity.roll = rollError * Math.min(4.0, 2.0 + forwardSpeed * 0.15);
+                        car.rotation.z = THREE.MathUtils.lerp(currentRoll, targetRollZ, delta * rotationSmoothing);
+                    } else {
+                        // Car is stationary - COMPLETELY skip pitch/roll updates
+                        // Don't calculate target, don't interpolate, don't do anything
+                        // Just maintain current pitch/roll exactly as is
+                        const bodyMesh = car.userData.bodyMesh;
+                        if (bodyMesh) {
+                            // Keep current pitch exactly as is, clear angular velocity
+                            car.userData.angularVelocity.pitch = 0;
+                        }
+                        car.userData.angularVelocity.roll = 0;
+                        // Don't touch bodyMesh.rotation.x or car.rotation.z at all
                     }
-                    
-                    const currentRoll = car.rotation.z || 0;
-                    const rollError = targetRollZ - currentRoll;
-                    // Angular velocity pushes toward target (no limits)
-                    car.userData.angularVelocity.roll = rollError * Math.min(4.0, 2.0 + forwardSpeed * 0.15);
-                    car.rotation.z = THREE.MathUtils.lerp(currentRoll, targetRollZ, delta * rotationSmoothing);
                 }
                 
                 // Update previous airborne state for next frame
