@@ -11,39 +11,98 @@
     <div id="login-screen">
         <div id="login-panel">
             <h1>3D Multiplayer Building Game</h1>
-            <div class="form-group">
-                <label for="player-name">Your Name:</label>
-                <input type="text" id="player-name" placeholder="Enter your name" maxlength="20" />
-            </div>
-            <div class="form-group">
-                <label>Body Color:</label>
-                <div id="color-picker">
-                    <div class="color-option" data-color="0x4a9eff" style="background: #4a9eff;"></div>
-                    <div class="color-option" data-color="0xff6b6b" style="background: #ff6b6b;"></div>
-                    <div class="color-option" data-color="0x51cf66" style="background: #51cf66;"></div>
-                    <div class="color-option" data-color="0xffd93d" style="background: #ffd93d;"></div>
-                    <div class="color-option" data-color="0xa78bfa" style="background: #a78bfa;"></div>
-                    <div class="color-option" data-color="0xfb7185" style="background: #fb7185;"></div>
-                    <div class="color-option" data-color="0x60a5fa" style="background: #60a5fa;"></div>
-                    <div class="color-option" data-color="0x34d399" style="background: #34d399;"></div>
-                    <div class="color-option" data-color="0xfbbf24" style="background: #fbbf24;"></div>
-                    <div class="color-option" data-color="0xf472b6" style="background: #f472b6;"></div>
-                    <div class="color-option" data-color="0x818cf8" style="background: #818cf8;"></div>
-                    <div class="color-option" data-color="0xffffff" style="background: #ffffff; border: 2px solid #ccc;"></div>
+            
+            <!-- Auth Section -->
+            <div id="auth-section">
+                <div class="tabs">
+                    <button class="tab-btn active" data-tab="login">Login</button>
+                    <button class="tab-btn" data-tab="create">Create Account</button>
+                    <button class="tab-btn" data-tab="guest">Play as Guest</button>
+                </div>
+                
+                <div id="login-tab" class="tab-content active">
+                    <div class="form-group">
+                        <label for="login-username">Username:</label>
+                        <input type="text" id="login-username" placeholder="Enter username" maxlength="20" />
+                    </div>
+                    <div class="form-group">
+                        <label for="login-password">Password:</label>
+                        <input type="password" id="login-password" placeholder="Enter password" />
+                    </div>
+                    <div id="login-message" class="message"></div>
+                    <button id="login-btn">Login</button>
+                </div>
+                
+                <div id="create-tab" class="tab-content">
+                    <div class="form-group">
+                        <label for="create-username">Username:</label>
+                        <input type="text" id="create-username" placeholder="Enter username" maxlength="20" />
+                    </div>
+                    <div class="form-group">
+                        <label for="create-password">Password:</label>
+                        <input type="password" id="create-password" placeholder="Enter password" />
+                    </div>
+                    <div id="create-message" class="message"></div>
+                    <button id="create-account-btn">Create Account</button>
+                </div>
+                
+                <div id="guest-tab" class="tab-content">
+                    <div class="form-group">
+                        <label for="guest-name">Your Name:</label>
+                        <input type="text" id="guest-name" placeholder="Enter your name" maxlength="20" />
+                    </div>
+                    <button id="guest-play-btn">Play as Guest</button>
                 </div>
             </div>
-            <div class="form-group">
-                <label>Hat:</label>
-                <div id="hat-selector">
-                    <div class="hat-option" data-hat="none">None</div>
-                    <div class="hat-option" data-hat="cap">🧢 Cap</div>
-                    <div class="hat-option" data-hat="tophat">🎩 Top Hat</div>
-                    <div class="hat-option" data-hat="crown">👑 Crown</div>
-                    <div class="hat-option" data-hat="helmet">⛑️ Helmet</div>
-                    <div class="hat-option" data-hat="cowboy">🤠 Cowboy</div>
+            
+            <!-- Customization Section (shown after auth) -->
+            <div id="customization-section" style="display: none;">
+                <div class="customization-layout">
+                    <div class="preview-container">
+                        <canvas id="preview-canvas"></canvas>
+                    </div>
+                    <div class="customization-options">
+                        <div class="form-group">
+                            <label>Body Color:</label>
+                            <div id="color-picker">
+                                <div class="color-option" data-color="0x4a9eff" style="background: #4a9eff;"></div>
+                                <div class="color-option" data-color="0xff6b6b" style="background: #ff6b6b;"></div>
+                                <div class="color-option" data-color="0x51cf66" style="background: #51cf66;"></div>
+                                <div class="color-option" data-color="0xffd93d" style="background: #ffd93d;"></div>
+                                <div class="color-option" data-color="0xa78bfa" style="background: #a78bfa;"></div>
+                                <div class="color-option" data-color="0xfb7185" style="background: #fb7185;"></div>
+                                <div class="color-option" data-color="0x60a5fa" style="background: #60a5fa;"></div>
+                                <div class="color-option" data-color="0x34d399" style="background: #34d399;"></div>
+                                <div class="color-option" data-color="0xfbbf24" style="background: #fbbf24;"></div>
+                                <div class="color-option" data-color="0xf472b6" style="background: #f472b6;"></div>
+                                <div class="color-option" data-color="0x818cf8" style="background: #818cf8;"></div>
+                                <div class="color-option" data-color="0xffffff" style="background: #ffffff; border: 2px solid #ccc;"></div>
+                            </div>
+                        </div>
+                        <div class="form-group" id="hat-group">
+                            <label>Hat:</label>
+                            <div id="hat-selector">
+                                <div class="hat-option" data-hat="none">None</div>
+                                <div class="hat-option" data-hat="cap">🧢 Cap</div>
+                                <div class="hat-option" data-hat="tophat">🎩 Top Hat</div>
+                                <div class="hat-option" data-hat="crown">👑 Crown</div>
+                                <div class="hat-option" data-hat="helmet">⛑️ Helmet</div>
+                                <div class="hat-option" data-hat="cowboy">🤠 Cowboy</div>
+                            </div>
+                        </div>
+                        <div class="form-group" id="cape-group">
+                            <label>Cape:</label>
+                            <div id="cape-selector">
+                                <div class="cape-option" data-cape="none">None</div>
+                                <div class="cape-option" data-cape="red">🔴 Red Cape</div>
+                                <div class="cape-option" data-cape="blue">🔵 Blue Cape</div>
+                                <div class="cape-option" data-cape="helldiver">✨ Helldiver Cape</div>
+                            </div>
+                        </div>
+                        <button id="start-game-btn">Start Game</button>
+                    </div>
                 </div>
             </div>
-            <button id="start-game-btn">Start Game</button>
         </div>
     </div>
 

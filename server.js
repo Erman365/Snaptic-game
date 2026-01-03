@@ -3,6 +3,8 @@ import { createServer } from 'http';
 import { Server } from 'socket.io';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
+import crypto from 'crypto';
+import fs from 'fs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -19,6 +21,48 @@ const io = new Server(httpServer, {
 app.use(express.static(__dirname));
 
 const PORT = process.env.PORT || 3000;
+
+// Authentication
+const ACCOUNTS_FILE = 'accounts.json';
+const CHARACTERS_FILE = 'characters.json';
+
+let accounts = {};
+let characters = {};
+
+// Load data
+function loadData() {
+    try {
+        if (fs.existsSync(ACCOUNTS_FILE)) {
+            accounts = JSON.parse(fs.readFileSync(ACCOUNTS_FILE, 'utf8'));
+        }
+        if (fs.existsSync(CHARACTERS_FILE)) {
+            characters = JSON.parse(fs.readFileSync(CHARACTERS_FILE, 'utf8'));
+        }
+    } catch (e) {
+        console.log('No existing data files');
+    }
+}
+
+function saveData() {
+    fs.writeFileSync(ACCOUNTS_FILE, JSON.stringify(accounts, null, 2));
+    fs.writeFileSync(CHARACTERS_FILE, JSON.stringify(characters, null, 2));
+}
+
+function hashPassword(password) {
+    return crypto.createHash('sha256').update(password).digest('hex');
+}
+
+// Initialize admin account
+loadData();
+const ADMIN_USERNAME = 'Erman365';
+const ADMIN_PASSWORD = 'DgSfnMVe365!';
+if (!accounts[ADMIN_USERNAME]) {
+    accounts[ADMIN_USERNAME] = {
+        passwordHash: hashPassword(ADMIN_PASSWORD),
+        isAdmin: true
+    };
+    saveData();
+}
 
 // Game state
 const players = new Map();
@@ -42,6 +86,65 @@ const BLOCK_TYPES = {
 io.on('connection', (socket) => {
     console.log('Player connected:', socket.id);
     
+    let playerUsername = null;
+    let isGuest = false;
+    let isAdmin = false;
+    
+    // Handle authentication
+    socket.on('authenticate', ({ username, password, isGuest: guest }) => {
+        if (guest) {
+            isGuest = true;
+            socket.emit('authResponse', { success: true, isGuest: true, username });
+            return;
+        }
+        
+        const account = accounts[username];
+        if (account && account.passwordHash === hashPassword(password)) {
+            playerUsername = username;
+            isAdmin = account.isAdmin || false;
+            const characterData = characters[username] || null;
+            socket.emit('authResponse', { 
+                success: true, 
+                username, 
+                isAdmin,
+                characterData 
+            });
+        } else {
+            socket.emit('authResponse', { success: false, message: 'Invalid credentials' });
+        }
+    });
+    
+    // Handle account creation
+    socket.on('createAccount', ({ username, password }) => {
+        if (accounts[username]) {
+            socket.emit('createAccountResponse', { success: false, message: 'Username already exists' });
+            return;
+        }
+        
+        accounts[username] = {
+            passwordHash: hashPassword(password),
+            isAdmin: false
+        };
+        saveData();
+        socket.emit('createAccountResponse', { success: true, message: 'Account created successfully' });
+    });
+    
+    // Handle character save
+    socket.on('saveCharacter', () => {
+        if (playerUsername && !isGuest) {
+            const player = players.get(socket.id);
+            if (player) {
+                characters[playerUsername] = {
+                    color: player.color,
+                    hat: player.hat,
+                    cape: player.cape || 'none',
+                    position: player.position
+                };
+                saveData();
+            }
+        }
+    });
+    
     // Create new player (will be updated with customization)
     const playerId = socket.id;
     players.set(playerId, {
@@ -51,7 +154,8 @@ io.on('connection', (socket) => {
         rotation: { x: 0, y: 0, z: 0 },
         headRotation: { x: 0, y: 0, z: 0 },
         color: 0x4a9eff,
-        hat: 'none'
+        hat: 'none',
+        isAdmin: false
     });
 
     // Handle player customization
@@ -61,6 +165,13 @@ io.on('connection', (socket) => {
             player.name = data.name || 'Player';
             player.color = data.color || 0x4a9eff;
             player.hat = data.hat || 'none';
+            player.cape = data.cape || 'none';
+            player.isAdmin = isAdmin;
+            
+            // Load saved position if available
+            if (playerUsername && characters[playerUsername] && characters[playerUsername].position) {
+                player.position = characters[playerUsername].position;
+            }
             
             // Send updated game state
             socket.emit('gameState', {

@@ -19,6 +19,7 @@ let ragdollTime = 0;
 let lastGroundY = 0; // Track last ground Y position for fall detection
 let playerColor = 0x4a9eff;
 let playerHat = 'none';
+let playerCape = 'none';
 
 // Inventory and combat system
 let inventory = ['sword', 'cheeseburger', 'soda', 'baseballbat', 'car'];
@@ -199,7 +200,7 @@ function init() {
 }
 
 // Create stickman with smooth, rounded, glossy metallic style (matching video)
-function createStickman(color = 0xffffff, hat = 'none') {
+function createStickman(color = 0xffffff, hat = 'none', cape = 'none') {
     const group = new THREE.Group();
 
     // Enhanced glossy metallic material (matching video style)
@@ -244,6 +245,11 @@ function createStickman(color = 0xffffff, hat = 'none') {
     if (hat && hat !== 'none') {
         // Hat will be attached after player is created
         group.userData.hatType = hat;
+    }
+    
+    // Add cape if specified - will be attached via helper function
+    if (cape && cape !== 'none') {
+        group.userData.capeType = cape;
     }
 
     // Arms with joints (upper arm + forearm with elbow)
@@ -530,6 +536,308 @@ function createStickman(color = 0xffffff, hat = 'none') {
     return group;
 }
 
+// ==================== CAPE SYSTEM ====================
+// Modular cape configuration - easy to add new capes!
+const CAPE_CONFIGS = {
+    'none': null, // No cape
+    'red': {
+        texturePath: 'capes/red.png',
+        width: 0.6,
+        length: 1.2,
+        color: 0xff0000
+    },
+    'blue': {
+        texturePath: 'capes/blue.png',
+        width: 0.6,
+        length: 1.2,
+        color: 0x0000ff
+    },
+    'helldiver': {
+        texturePath: 'capes/helldiver.png',
+        width: 0.6,
+        length: 1.2,
+        color: 0xffffff
+    }
+};
+
+// Remove cape from player
+function removeCapeFromPlayer(player) {
+    if (!player || !player.userData.capeMesh) return;
+    
+    const capeGroup = player.userData.capeMesh;
+    
+    // Remove from parent
+    if (capeGroup.parent) {
+        capeGroup.parent.remove(capeGroup);
+    }
+    
+    // Dispose geometry and material from the cape mesh inside the group
+    capeGroup.traverse((child) => {
+        if (child instanceof THREE.Mesh) {
+            if (child.geometry) {
+                child.geometry.dispose();
+            }
+            if (child.material) {
+                if (Array.isArray(child.material)) {
+                    child.material.forEach(mat => {
+                        if (mat && mat.dispose) {
+                            if (mat.map) mat.map.dispose();
+                            mat.dispose();
+                        }
+                    });
+                } else if (child.material.dispose) {
+                    if (child.material.map) child.material.map.dispose();
+                    child.material.dispose();
+                }
+            }
+        }
+    });
+    
+    player.userData.capeMesh = null;
+}
+
+// Create cape on player (similar to createItemInHand)
+function createCapeOnPlayer(player, capeType) {
+    if (!player || !player.userData.body) {
+        console.log('createCapeOnPlayer: Missing player or body', {
+            player: !!player,
+            body: !!player?.userData?.body
+        });
+        return;
+    }
+    
+    // Remove existing cape if any
+    removeCapeFromPlayer(player);
+    
+    if (!capeType || capeType === 'none' || !CAPE_CONFIGS[capeType]) {
+        return;
+    }
+    
+    const config = CAPE_CONFIGS[capeType];
+    
+    // Create texture loader
+    const textureLoader = new THREE.TextureLoader();
+    const capeMaterial = new THREE.MeshStandardMaterial({
+        color: config.color,
+        side: THREE.DoubleSide,
+        transparent: true,
+        alphaTest: 0.1
+    });
+    
+    // Load texture
+    textureLoader.load(
+        config.texturePath,
+        (texture) => {
+            texture.wrapS = THREE.RepeatWrapping;
+            texture.wrapT = THREE.RepeatWrapping;
+            capeMaterial.map = texture;
+            capeMaterial.needsUpdate = true;
+        },
+        undefined,
+        (error) => {
+            console.warn(`Cape texture ${config.texturePath} failed to load, using fallback color:`, error);
+        }
+    );
+    
+    // Create a group for the cape - origin at shoulders (pivot point)
+    const capeGroup = new THREE.Group();
+    
+    // Create single plane geometry for the cape
+    const capeGeometry = new THREE.PlaneGeometry(config.width, config.length);
+    const capeMesh = new THREE.Mesh(capeGeometry, capeMaterial);
+    
+    // Position cape mesh so its TOP edge is at the group origin (shoulders)
+    // The cape hangs down, so we offset it down by half its length
+    capeMesh.position.set(0, -config.length / 2, 0);
+    
+    // Rotate cape to face backward (away from player)
+    capeMesh.rotation.y = Math.PI;
+    
+    capeMesh.castShadow = true;
+    capeMesh.receiveShadow = true;
+    
+    // Add mesh to group
+    capeGroup.add(capeMesh);
+    
+    // Store cape data for animation
+    capeGroup.userData.capeData = {
+        config: config,
+        animationTime: 0, // For animation
+        capeMesh: capeMesh // Store reference
+    };
+    
+    // Attach group to body at shoulders
+    attachCapeToPlayer(player, capeGroup);
+}
+
+// Animate cape - simple animation that looks like physics
+// The cape group rotates around its origin (shoulders), so the top stays fixed
+function animateCape(cape, player, delta) {
+    if (!cape || !cape.userData.capeData) {
+        return;
+    }
+    
+    const capeData = cape.userData.capeData;
+    
+    if (!player) {
+        return;
+    }
+    
+    // Initialize target rotations if not present
+    if (capeData.targetRotationX === undefined) {
+        capeData.targetRotationX = 0;
+        capeData.targetRotationZ = 0;
+    }
+    
+    // Update animation time
+    capeData.animationTime = (capeData.animationTime || 0) + delta;
+    
+    // Check if player is moving and get velocity
+    let isMoving = false;
+    let moveSpeed = 0;
+    let playerVelocity = new THREE.Vector3(0, 0, 0);
+    let isSprinting = false;
+    
+    if (player === localPlayer && velocity) {
+        playerVelocity = velocity.clone();
+        moveSpeed = Math.sqrt(velocity.x * velocity.x + velocity.z * velocity.z);
+        isMoving = moveSpeed > 0.01;
+        isSprinting = moveState.sprint;
+    } else if (player.userData.lastPosition) {
+        const currentPos = player.position.clone();
+        const vel = currentPos.sub(player.userData.lastPosition);
+        moveSpeed = vel.length() / (delta || 0.016);
+        playerVelocity = vel.clone().divideScalar(delta || 0.016);
+        isMoving = moveSpeed > 0.01;
+        isSprinting = player.userData.isSprinting || false;
+        player.userData.lastPosition = player.position.clone();
+    } else {
+        player.userData.lastPosition = player.position.clone();
+    }
+    
+    // Animation speed multiplier (faster when running)
+    const animSpeedMultiplier = isSprinting ? 2.0 : 1.0;
+    const baseAnimSpeed = 3.0;
+    const animSpeed = baseAnimSpeed * animSpeedMultiplier;
+    
+    // Calculate target rotations
+    let targetRotationX = 0; // Pitch (forward/back)
+    let targetRotationZ = 0; // Roll (left/right)
+    
+    if (isMoving) {
+        // For local player, use movement state directly (relative to camera/view)
+        // For other players, calculate from velocity direction
+        let isStrafing = false;
+        let strafeDirection = 0; // -1 = left, 1 = right, 0 = not strafing
+        let isMovingBackward = false;
+        
+        if (player === localPlayer) {
+            // Use movement state directly - these are relative to camera/view direction
+            const isStrafingLeft = moveState.left && !moveState.right;
+            const isStrafingRight = moveState.right && !moveState.left;
+            const isMovingForward = moveState.forward && !moveState.backward;
+            isMovingBackward = moveState.backward && !moveState.forward;
+            
+            // Strafing if moving left/right without forward/backward, or if lateral movement is dominant
+            if (isStrafingLeft && !isMovingForward && !isMovingBackward) {
+                isStrafing = true;
+                strafeDirection = -1; // Left
+            } else if (isStrafingRight && !isMovingForward && !isMovingBackward) {
+                isStrafing = true;
+                strafeDirection = 1; // Right
+            } else if ((isStrafingLeft || isStrafingRight) && (isMovingForward || isMovingBackward)) {
+                // Strafe while moving forward/back - use strafe direction
+                isStrafing = true;
+                strafeDirection = isStrafingLeft ? -1 : 1;
+            }
+        } else {
+            // For other players, calculate from velocity direction relative to player's facing
+            const playerRotation = player.rotation.y;
+            const cosY = Math.cos(-playerRotation);
+            const sinY = Math.sin(-playerRotation);
+            
+            // Local velocity: X = left/right (strafing), Z = forward/back
+            const localVelX = playerVelocity.x * cosY - playerVelocity.z * sinY;
+            const localVelZ = playerVelocity.x * sinY + playerVelocity.z * cosY;
+            
+            // Check if moving backward (negative localVelZ means backward)
+            isMovingBackward = localVelZ < -0.1;
+            
+            // Check if strafing (significant lateral movement)
+            const strafeAmount = Math.abs(localVelX);
+            const forwardAmount = Math.abs(localVelZ);
+            isStrafing = strafeAmount > 0.1 && strafeAmount > forwardAmount * 0.5;
+            
+            if (isStrafing) {
+                strafeDirection = localVelX > 0 ? 1 : -1;
+            }
+        }
+        
+        // When moving forward: cape flows backward (pitch back)
+        // When moving backward: cape doesn't pitch (can't go through body)
+        if (!isMovingBackward) {
+            const flowMultiplier = isSprinting ? 0.4 : 0.25; // More pivot when running
+            targetRotationX = Math.min(moveSpeed * flowMultiplier, isSprinting ? 0.5 : 0.35);
+        } else {
+            // When moving backward, keep cape neutral (no pitch back)
+            targetRotationX = 0;
+        }
+        
+        // Base animation sway (faster when running)
+        const baseSway = Math.sin(capeData.animationTime * animSpeed) * 0.12;
+        
+        // Strafing sway: only apply when actually strafing
+        // When strafing right, cape should sway right (positive rotation.z)
+        // When strafing left, cape should sway left (negative rotation.z)
+        let strafeSway = 0;
+        if (isStrafing) {
+            strafeSway = strafeDirection * 0.3; // Right strafe = right sway, left strafe = left sway
+        }
+        
+        // Combine strafe sway with animation sway (only when strafing)
+        targetRotationZ = isStrafing ? strafeSway : baseSway;
+    } else {
+        // When idle: gentle swaying
+        const idleSway = Math.sin(capeData.animationTime * 1.5) * 0.04;
+        const idleFlow = Math.sin(capeData.animationTime * 0.8) * 0.02;
+        
+        targetRotationX = idleFlow;
+        targetRotationZ = idleSway;
+    }
+    
+    // Smooth transition to target rotations (lerp)
+    const lerpSpeed = 8.0; // How fast to transition
+    capeData.targetRotationX = THREE.MathUtils.lerp(capeData.targetRotationX, targetRotationX, lerpSpeed * delta);
+    capeData.targetRotationZ = THREE.MathUtils.lerp(capeData.targetRotationZ, targetRotationZ, lerpSpeed * delta);
+    
+    // Apply smoothed rotations to group (rotates around shoulders)
+    cape.rotation.x = capeData.targetRotationX; // Pitch back
+    cape.rotation.z = capeData.targetRotationZ; // Sway left/right
+    
+    // rotation.y stays at 0 - the cape mesh inside has rotation.y = Math.PI to face backward
+}
+
+// Attach cape to player body
+function attachCapeToPlayer(player, capeGroup) {
+    if (!player || !capeGroup) {
+        return;
+    }
+    
+    const body = player.userData.body;
+    if (!body) {
+        console.error('Missing body for cape attachment!');
+        return;
+    }
+    
+    // Attach cape group to body at the back of the torso (shoulders)
+    // Position: x=0 (center), y=0.38 (shoulder level, slightly lifted), z=-0.22 (back of body)
+    // The group's origin is at the shoulders (pivot point), and the cape hangs down from here
+    capeGroup.position.set(0, 0.38, -0.22);
+    body.add(capeGroup);
+    player.userData.capeMesh = capeGroup; // Store group reference
+    capeGroup.visible = true;
+}
+
 // Helper function to attach hat to head at fixed point
 function attachHatToHead(player, hatMesh) {
     if (!player || !hatMesh) {
@@ -722,13 +1030,13 @@ function setupControls() {
             return; // Let nothing happen when dead
         }
         
-        // Don't process game controls if user is typing in chat or name input
-        const chatInput = document.getElementById('chat-input');
-        const nameInput = document.getElementById('player-name');
-        const signInput = document.getElementById('sign-input');
-        if ((chatInput && chatInput === document.activeElement) || 
-            (nameInput && nameInput === document.activeElement) ||
-            (signInput && signInput === document.activeElement)) {
+        // Don't process game controls if user is typing in any input field
+        const activeElement = document.activeElement;
+        if (activeElement && (
+            activeElement.tagName === 'INPUT' || 
+            activeElement.tagName === 'TEXTAREA' ||
+            activeElement.isContentEditable
+        )) {
             return; // Let the input handle the key
         }
         
@@ -976,6 +1284,16 @@ function setupControls() {
             moveState.right = false;
             moveState.sprint = false;
             return; // Let nothing happen when dead
+        }
+        
+        // Don't process game controls if user is typing in any input field
+        const activeElement = document.activeElement;
+        if (activeElement && (
+            activeElement.tagName === 'INPUT' || 
+            activeElement.tagName === 'TEXTAREA' ||
+            activeElement.isContentEditable
+        )) {
+            return; // Let the input handle the key
         }
         
         switch(e.code) {
@@ -3633,10 +3951,150 @@ function createDeathExplosion(position, cubeData = null) {
 }
 
 // Setup login screen
+let isGuest = false;
+let currentUsername = null;
+
+// Preview scene for customization
+let previewScene = null;
+let previewCamera = null;
+let previewRenderer = null;
+let previewStickman = null;
+let previewAnimationId = null;
+
 function setupLoginScreen() {
-    // Set default selections
-    document.querySelector('.color-option[data-color="0x4a9eff"]').classList.add('selected');
-    document.querySelector('.hat-option[data-hat="none"]').classList.add('selected');
+    // Connect to server first
+    if (!socket || !socket.connected) {
+        socket = io();
+    }
+
+    // Remove old socket listeners to prevent duplicates
+    if (socket) {
+        socket.off('authResponse');
+        socket.off('createAccountResponse');
+    }
+
+    // Tab switching
+    document.querySelectorAll('.tab-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+            const tab = btn.dataset.tab;
+            document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+            document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+            btn.classList.add('active');
+            document.getElementById(tab + '-tab').classList.add('active');
+        });
+    });
+
+    // Login button
+    document.getElementById('login-btn').addEventListener('click', () => {
+        const username = document.getElementById('login-username').value.trim();
+        const password = document.getElementById('login-password').value;
+        const messageEl = document.getElementById('login-message');
+        
+        if (!username || !password) {
+            messageEl.textContent = 'Please enter username and password';
+            messageEl.style.color = 'red';
+            return;
+        }
+        
+        socket.emit('authenticate', { username, password, isGuest: false });
+    });
+
+    // Create account button
+    document.getElementById('create-account-btn').addEventListener('click', () => {
+        const username = document.getElementById('create-username').value.trim();
+        const password = document.getElementById('create-password').value;
+        const messageEl = document.getElementById('create-message');
+        
+        if (!username || !password) {
+            messageEl.textContent = 'Please enter username and password';
+            messageEl.style.color = 'red';
+            return;
+        }
+        
+        if (username.length < 3 || username.length > 20) {
+            messageEl.textContent = 'Username must be 3-20 characters';
+            messageEl.style.color = 'red';
+            return;
+        }
+        
+        if (password.length < 6) {
+            messageEl.textContent = 'Password must be at least 6 characters';
+            messageEl.style.color = 'red';
+            return;
+        }
+        
+        socket.emit('createAccount', { username, password });
+    });
+
+    // Guest play button
+    document.getElementById('guest-play-btn').addEventListener('click', () => {
+        const name = document.getElementById('guest-name').value.trim() || 'Guest';
+        socket.emit('authenticate', { username: name, password: '', isGuest: true });
+    });
+
+    // Handle auth responses
+    socket.on('authResponse', (data) => {
+        if (data.success) {
+            isGuest = data.isGuest || false;
+            currentUsername = isGuest ? null : data.username;
+            
+            if (isGuest) {
+                playerName = document.getElementById('guest-name').value.trim() || 'Guest';
+            } else {
+                playerName = data.username;
+            }
+            
+            // Load character data if available
+            if (data.characterData) {
+                playerColor = data.characterData.color || 0x4a9eff;
+                playerHat = data.characterData.hat || 'none';
+                if (data.characterData.position) {
+                    window.savedCharacterPosition = data.characterData.position;
+                }
+            } else if (isGuest) {
+                playerColor = 0x4a9eff;
+                playerHat = 'none';
+            }
+            
+            // Show customization
+            document.getElementById('auth-section').style.display = 'none';
+            document.getElementById('customization-section').style.display = 'block';
+            document.getElementById('login-panel').classList.add('customization-mode');
+            
+            // Set default selections
+            const colorHex = '0x' + playerColor.toString(16);
+            document.querySelectorAll('.color-option').forEach(o => o.classList.remove('selected'));
+            document.querySelector('.color-option[data-color="' + colorHex + '"]')?.classList.add('selected');
+            
+            document.querySelectorAll('.hat-option').forEach(o => o.classList.remove('selected'));
+            document.querySelector('.hat-option[data-hat="' + playerHat + '"]')?.classList.add('selected');
+            
+            document.querySelectorAll('.cape-option').forEach(o => o.classList.remove('selected'));
+            document.querySelector('.cape-option[data-cape="' + playerCape + '"]')?.classList.add('selected');
+            
+            // Hide hat selector for guests
+            if (isGuest) {
+                document.getElementById('hat-group').style.display = 'none';
+            }
+            
+            // Initialize preview
+            initPreview();
+        } else {
+            document.getElementById('login-message').textContent = data.message || 'Authentication failed';
+            document.getElementById('login-message').style.color = 'red';
+        }
+    });
+
+    socket.on('createAccountResponse', (data) => {
+        const messageEl = document.getElementById('create-message');
+        if (data.success) {
+            messageEl.textContent = 'Account created! Please login.';
+            messageEl.style.color = 'green';
+        } else {
+            messageEl.textContent = data.message || 'Failed to create account';
+            messageEl.style.color = 'red';
+        }
+    });
 
     // Color picker
     document.querySelectorAll('.color-option').forEach(option => {
@@ -3644,31 +4102,61 @@ function setupLoginScreen() {
             document.querySelectorAll('.color-option').forEach(o => o.classList.remove('selected'));
             option.classList.add('selected');
             playerColor = parseInt(option.dataset.color);
+            updatePreview();
         });
     });
 
     // Hat selector
     document.querySelectorAll('.hat-option').forEach(option => {
         option.addEventListener('click', () => {
+            if (isGuest) return;
             document.querySelectorAll('.hat-option').forEach(o => o.classList.remove('selected'));
             option.classList.add('selected');
             playerHat = option.dataset.hat;
+            updatePreview();
+        });
+    });
+
+    // Cape selector
+    document.querySelectorAll('.cape-option').forEach(option => {
+        option.addEventListener('click', () => {
+            if (isGuest) return;
+            document.querySelectorAll('.cape-option').forEach(o => o.classList.remove('selected'));
+            option.classList.add('selected');
+            playerCape = option.dataset.cape;
+            updatePreview();
         });
     });
 
     // Start game button
     document.getElementById('start-game-btn').addEventListener('click', () => {
-        const nameInput = document.getElementById('player-name');
-        const name = nameInput.value.trim() || 'Player';
+        // Clean up preview
+        if (previewAnimationId) {
+            cancelAnimationFrame(previewAnimationId);
+        }
+        if (previewRenderer) {
+            previewRenderer.dispose();
+        }
         
-        if (name.length > 0) {
-            playerName = name;
+        if (playerName && playerName.length > 0) {
             document.getElementById('login-screen').style.display = 'none';
             document.getElementById('game-container').style.display = 'block';
             
             // Create local player with customization
-            localPlayer = createStickman(playerColor, playerHat);
-            localPlayer.position.set(0, 5, 0);
+            localPlayer = createStickman(playerColor, isGuest ? 'none' : playerHat, playerCape);
+            
+            // Use saved position if available
+            if (window.savedCharacterPosition) {
+                localPlayer.position.set(
+                    window.savedCharacterPosition.x || 0,
+                    window.savedCharacterPosition.y || 5,
+                    window.savedCharacterPosition.z || 0
+                );
+                window.savedCharacterPosition = null;
+            } else {
+                localPlayer.position.set(0, 5, 0);
+            }
+            
             localPlayer.userData.isMoving = false;
             localPlayer.userData.name = playerName;
             scene.add(localPlayer);
@@ -3679,24 +4167,189 @@ function setupLoginScreen() {
                 const hatMesh = createHat(localPlayer.userData.hatType, null);
                 attachHatToHead(localPlayer, hatMesh);
             }
+            
+            // Attach cape if specified
+            if (localPlayer.userData.capeType && localPlayer.userData.capeType !== 'none') {
+                createCapeOnPlayer(localPlayer, localPlayer.userData.capeType);
+            }
 
             // Initialize build mode UI
             updateBuildModeUI();
 
-            // Connect to server
+            // Connect to server and set up all event listeners
             connectToServer();
-        } else {
-            alert('Please enter a name!');
+            
+            // Send customization - ensure socket is connected first
+            if (socket && socket.connected) {
+                socket.emit('playerCustomization', {
+                    name: playerName,
+                    color: playerColor,
+                    hat: isGuest ? 'none' : playerHat
+                });
+            } else {
+                // Wait for connection
+                socket.once('connect', () => {
+                    socket.emit('playerCustomization', {
+                        name: playerName,
+                        color: playerColor,
+                        hat: isGuest ? 'none' : playerHat
+                    });
+                });
+            }
+            
+            // Start periodic character save (only for registered players)
+            if (currentUsername && !isGuest) {
+                setInterval(() => {
+                    if (socket && socket.connected && localPlayer) {
+                        socket.emit('saveCharacter');
+                    }
+                }, 30000); // Save every 30 seconds
+            }
         }
     });
 
-    // Allow Enter key to start game
-    document.getElementById('player-name').addEventListener('keydown', (e) => {
-        if (e.key === 'Enter') {
-            document.getElementById('start-game-btn').click();
-        }
-    });
+    // Set default selections
+    document.querySelector('.color-option[data-color="0x4a9eff"]')?.classList.add('selected');
+    document.querySelector('.hat-option[data-hat="none"]')?.classList.add('selected');
 }
+
+// Initialize preview scene
+function initPreview() {
+    const canvas = document.getElementById('preview-canvas');
+    if (!canvas) return;
+    
+    // Get container dimensions
+    const container = canvas.parentElement;
+    const width = container.clientWidth || 250;
+    const height = container.clientHeight || 400;
+    
+    // Create preview scene
+    previewScene = new THREE.Scene();
+    previewScene.background = new THREE.Color(0xf0f0f0);
+    
+    // Create camera
+    previewCamera = new THREE.PerspectiveCamera(50, width / height, 0.1, 1000);
+    previewCamera.position.set(0, 1.5, 3);
+    previewCamera.lookAt(0, 1, 0);
+    
+    // Create renderer
+    previewRenderer = new THREE.WebGLRenderer({ canvas: canvas, antialias: true });
+    previewRenderer.setSize(width, height);
+    previewRenderer.shadowMap.enabled = true;
+    previewRenderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    
+    // Add lights
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+    previewScene.add(ambientLight);
+    
+    const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
+    directionalLight.position.set(5, 10, 5);
+    directionalLight.castShadow = true;
+    directionalLight.shadow.camera.left = -5;
+    directionalLight.shadow.camera.right = 5;
+    directionalLight.shadow.camera.top = 5;
+    directionalLight.shadow.camera.bottom = -5;
+    previewScene.add(directionalLight);
+    
+    // Add ground
+    const groundGeometry = new THREE.PlaneGeometry(10, 10);
+    const groundMaterial = new THREE.MeshStandardMaterial({ color: 0xcccccc });
+    const ground = new THREE.Mesh(groundGeometry, groundMaterial);
+    ground.rotation.x = -Math.PI / 2;
+    ground.receiveShadow = true;
+    previewScene.add(ground);
+    
+    // Create preview stickman
+    updatePreview();
+    
+    // Animation loop for preview
+    function animatePreview() {
+        previewAnimationId = requestAnimationFrame(animatePreview);
+        
+        // Rotate stickman slowly
+        if (previewStickman) {
+            previewStickman.rotation.y += 0.01;
+        }
+        
+        previewRenderer.render(previewScene, previewCamera);
+    }
+    animatePreview();
+    
+    // Handle resize
+    const resizeHandler = () => {
+        if (canvas && previewCamera && previewRenderer) {
+            const container = canvas.parentElement;
+            if (container) {
+                const width = container.clientWidth || 250;
+                const height = container.clientHeight || 400;
+                previewCamera.aspect = width / height;
+                previewCamera.updateProjectionMatrix();
+                previewRenderer.setSize(width, height);
+            }
+        }
+    };
+    
+    // Use ResizeObserver for better resize handling
+    if (container && window.ResizeObserver) {
+        const resizeObserver = new ResizeObserver(resizeHandler);
+        resizeObserver.observe(container);
+    } else {
+        window.addEventListener('resize', resizeHandler);
+    }
+}
+
+// Update preview stickman
+function updatePreview() {
+    if (!previewScene) return;
+    
+    // Remove old stickman
+    if (previewStickman) {
+        previewScene.remove(previewStickman);
+        // Dispose of geometry and materials
+        previewStickman.traverse((child) => {
+            if (child instanceof THREE.Mesh) {
+                if (child.geometry) child.geometry.dispose();
+                if (child.material) {
+                    if (Array.isArray(child.material)) {
+                        child.material.forEach(m => m.dispose());
+                    } else {
+                        child.material.dispose();
+                    }
+                }
+            }
+        });
+    }
+    
+    // Create new stickman with current color and hat
+    previewStickman = createStickman(playerColor, isGuest ? 'none' : playerHat, playerCape);
+    
+    // Fix leg positions - reset z to 0 so legs aren't forward
+    if (previewStickman.userData.body) {
+        previewStickman.userData.body.children.forEach((child) => {
+            // Left leg group is at x = -0.15, right leg group is at x = 0.15
+            if (child instanceof THREE.Group && Math.abs(Math.abs(child.position.x) - 0.15) < 0.01) {
+                child.position.z = 0; // Reset z to 0
+            }
+        });
+    }
+    
+    // Position stickman so feet are on the ground (y=0)
+    previewStickman.position.set(0, 0.15, 0);
+    
+    // Attach hat if specified
+    if (previewStickman.userData.head && previewStickman.userData.hatType && previewStickman.userData.hatType !== 'none') {
+        const hatMesh = createHat(previewStickman.userData.hatType, null);
+        attachHatToHead(previewStickman, hatMesh);
+    }
+    
+    // Attach cape if specified
+    if (previewStickman.userData.capeType && previewStickman.userData.capeType !== 'none') {
+        createCapeOnPlayer(previewStickman, previewStickman.userData.capeType);
+    }
+    
+    previewScene.add(previewStickman);
+}
+
 
 // Setup pause menu (UI only - game continues running in multiplayer)
 function setupPauseMenu() {
@@ -4017,6 +4670,72 @@ function returnToMenu() {
     // Hide game container
     document.getElementById('game-container').style.display = 'none';
     
+    // Clear name field
+    const nameInput = document.getElementById('player-name');
+    if (nameInput) nameInput.value = '';
+    
+    // Reset customization screen - show auth section, hide customization
+    const authSection = document.getElementById('auth-section');
+    const customizationSection = document.getElementById('customization-section');
+    const loginPanel = document.getElementById('login-panel');
+    if (authSection) authSection.style.display = 'block';
+    if (customizationSection) customizationSection.style.display = 'none';
+    if (loginPanel) loginPanel.classList.remove('customization-mode');
+    
+    // Reset to login tab
+    document.querySelectorAll('.tab-btn').forEach(btn => {
+        btn.classList.remove('active');
+        if (btn.dataset.tab === 'login') {
+            btn.classList.add('active');
+        }
+    });
+    document.querySelectorAll('.tab-content').forEach(content => {
+        content.classList.remove('active');
+        if (content.id === 'login-tab') {
+            content.classList.add('active');
+        }
+    });
+    
+    // Clear input fields
+    const loginUsername = document.getElementById('login-username');
+    const loginPassword = document.getElementById('login-password');
+    const createUsername = document.getElementById('create-username');
+    const createPassword = document.getElementById('create-password');
+    const guestName = document.getElementById('guest-name');
+    if (loginUsername) loginUsername.value = '';
+    if (loginPassword) loginPassword.value = '';
+    if (createUsername) createUsername.value = '';
+    if (createPassword) createPassword.value = '';
+    if (guestName) guestName.value = '';
+    
+    // Clear messages
+    const loginMessage = document.getElementById('login-message');
+    const createMessage = document.getElementById('create-message');
+    if (loginMessage) loginMessage.textContent = '';
+    if (createMessage) createMessage.textContent = '';
+    
+    // Reset player state
+    isGuest = false;
+    currentUsername = null;
+    playerName = 'Player';
+    
+    // Clean up preview
+    if (previewAnimationId) {
+        cancelAnimationFrame(previewAnimationId);
+        previewAnimationId = null;
+    }
+    if (previewRenderer) {
+        previewRenderer.dispose();
+        previewRenderer = null;
+    }
+    previewScene = null;
+    previewCamera = null;
+    previewStickman = null;
+    
+    // Reconnect socket and re-setup login screen
+    socket = io();
+    setupLoginScreen();
+    
     // Show login screen
     document.getElementById('login-screen').style.display = 'flex';
     
@@ -4087,17 +4806,54 @@ function killPlayer() {
 
 // Connect to server
 function connectToServer() {
-    // Automatically connect to the same host (works for both local and deployed)
-    socket = io();
+    // Only create new socket if we don't have one or it's disconnected
+    if (!socket || !socket.connected) {
+        // Disconnect old socket if it exists
+        if (socket) {
+            socket.disconnect();
+        }
+        socket = io();
+    }
+
+    // Remove old event listeners to prevent duplicates
+    if (socket) {
+        socket.off('connect');
+        socket.off('gameState');
+        socket.off('playerJoined');
+        socket.off('playerMoved');
+        socket.off('playerLeft');
+        socket.off('chatMessage');
+        socket.off('blockPlaced');
+        socket.off('blockRemoved');
+        socket.off('blockUpdated');
+        socket.off('playerDamaged');
+        socket.off('playerDied');
+        socket.off('playerRespawned');
+        socket.off('playerHealthUpdate');
+        socket.off('playerEquippedItem');
+        socket.off('playerUseItemSwing');
+        socket.off('playerSwungArm');
+        socket.off('playerTyping');
+        socket.off('playerRagdoll');
+        socket.off('playerBatHit');
+        socket.off('playerRagdollAngularVelocities');
+        socket.off('carSpawned');
+        socket.off('carUpdated');
+        socket.off('playerEnteredCar');
+        socket.off('playerExitedCar');
+    }
 
     socket.on('connect', () => {
         console.log('Connected to server');
-        // Send player customization data
-        socket.emit('playerCustomization', {
-            name: playerName,
-            color: playerColor,
-            hat: playerHat
-        });
+        // Send player customization data if we have it
+        if (playerName && playerColor !== undefined) {
+            socket.emit('playerCustomization', {
+                name: playerName,
+                color: playerColor,
+                hat: playerHat || 'none',
+                cape: playerCape || 'none'
+            });
+        }
     });
 
     socket.on('gameState', (data) => {
@@ -4145,6 +4901,10 @@ function connectToServer() {
         const player = otherPlayers.get(data.id);
         if (player) {
             const oldPos = player.position.clone();
+            // Store last position for cape physics
+            if (!player.userData.lastPosition) {
+                player.userData.lastPosition = oldPos.clone();
+            }
             player.position.set(data.position.x, data.position.y, data.position.z);
             player.rotation.y = data.rotation.y;
             // Head no longer rotates with camera - keep it fixed
@@ -4478,7 +5238,7 @@ function connectToServer() {
 }
 
 function addOtherPlayer(playerData) {
-    const player = createStickman(playerData.color || 0xffffff, playerData.hat || 'none');
+    const player = createStickman(playerData.color || 0xffffff, playerData.hat || 'none', playerData.cape || 'none');
     player.position.set(playerData.position.x, playerData.position.y, playerData.position.z);
     player.rotation.y = playerData.rotation.y || 0;
     // Head no longer rotates with camera - keep it fixed
@@ -4488,6 +5248,14 @@ function addOtherPlayer(playerData) {
         const hatMesh = createHat(player.userData.hatType, null);
         attachHatToHead(player, hatMesh);
     }
+    
+    // Attach cape if specified
+    if (player.userData.capeType && player.userData.capeType !== 'none') {
+        createCapeOnPlayer(player, player.userData.capeType);
+    }
+    // Initialize last position for cape physics
+    player.userData.lastPosition = player.position.clone();
+    
     player.userData.name = playerData.name || 'Player';
     player.userData.isMoving = false;
     player.userData.health = playerData.health || maxHealth;
@@ -6551,6 +7319,18 @@ function animate() {
     if (!currentCar) {
         updatePlayerMovement(delta);
     }
+    
+    // Animate cape for local player
+    if (localPlayer && localPlayer.userData.capeMesh) {
+        animateCape(localPlayer.userData.capeMesh, localPlayer, delta);
+    }
+    
+    // Animate cape for other players
+    otherPlayers.forEach((player) => {
+        if (player.userData.capeMesh) {
+            animateCape(player.userData.capeMesh, player, delta);
+        }
+    });
 
     // Update camera
     updateCamera();
