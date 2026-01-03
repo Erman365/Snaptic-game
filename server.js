@@ -68,6 +68,10 @@ if (!accounts[ADMIN_USERNAME]) {
 const players = new Map();
 const blocks = new Map();
 const cars = new Map(); // Track all cars
+let botEnabled = false; // Bot state
+let botSocket = null; // Bot socket connection
+const flyingPlayers = new Set(); // Track players with fly enabled
+const adminStatus = new Map(); // Track admin status by socket ID (for immediate updates)
 
 // Helper function to generate unique ID
 function generateId() {
@@ -102,6 +106,8 @@ io.on('connection', (socket) => {
         if (account && account.passwordHash === hashPassword(password)) {
             playerUsername = username;
             isAdmin = account.isAdmin || false;
+            // Store admin status in Map for immediate access
+            adminStatus.set(socket.id, isAdmin);
             const characterData = characters[username] || null;
             socket.emit('authResponse', { 
                 success: true, 
@@ -153,7 +159,7 @@ io.on('connection', (socket) => {
         position: { x: 0, y: 5, z: 0 },
         rotation: { x: 0, y: 0, z: 0 },
         headRotation: { x: 0, y: 0, z: 0 },
-        color: 0x4a9eff,
+        color: 0x0066ff,
         hat: 'none',
         isAdmin: false
     });
@@ -163,7 +169,7 @@ io.on('connection', (socket) => {
         const player = players.get(playerId);
         if (player) {
             player.name = data.name || 'Player';
-            player.color = data.color || 0x4a9eff;
+            player.color = data.color || 0x0066ff;
             player.hat = data.hat || 'none';
             player.cape = data.cape || 'none';
             player.isAdmin = isAdmin;
@@ -209,10 +215,16 @@ io.on('connection', (socket) => {
         }
     });
 
-    // Handle chat messages
+    // Handle chat messages and commands
     socket.on('chatMessage', (message) => {
         const player = players.get(playerId);
         if (player && message.trim()) {
+            // Check if it's a command (starts with /)
+            if (message.startsWith('/')) {
+                handleCommand(socket, playerId, player, message, isAdmin);
+                return; // Don't broadcast commands as chat messages
+            }
+            
             const chatData = {
                 id: playerId,
                 name: player.name,
@@ -511,9 +523,554 @@ io.on('connection', (socket) => {
     socket.on('disconnect', () => {
         console.log('Player disconnected:', socket.id);
         players.delete(playerId);
+        flyingPlayers.delete(playerId); // Remove from flying players
+        adminStatus.delete(playerId); // Remove admin status
         socket.broadcast.emit('playerLeft', playerId);
     });
 });
+
+// Command handler
+function handleCommand(socket, playerId, player, message, isAdmin) {
+    const args = message.trim().split(/\s+/);
+    const command = args[0].toLowerCase();
+    
+    // Get current admin status (check Map first, then fall back to accounts)
+    const currentAdminStatus = adminStatus.get(playerId) || isAdmin;
+    
+    switch(command) {
+        case '/help':
+            const helpData = {
+                isAdmin: currentAdminStatus
+            };
+            console.log('Sending showHelpWindow to client:', helpData);
+            socket.emit('showHelpWindow', helpData);
+            break;
+            
+        case '/fly':
+            if (!currentAdminStatus) {
+                socket.emit('chatMessage', {
+                    id: 'system',
+                    name: 'System',
+                    username: 'System',
+                    message: 'You do not have permission to use this command',
+                    timestamp: new Date().toLocaleTimeString()
+                });
+                return;
+            }
+            
+            if (flyingPlayers.has(playerId)) {
+                flyingPlayers.delete(playerId);
+                socket.emit('chatMessage', {
+                    id: 'system',
+                    name: 'System',
+                    username: 'System',
+                    message: 'Fly mode disabled',
+                    timestamp: new Date().toLocaleTimeString()
+                });
+            } else {
+                flyingPlayers.add(playerId);
+                socket.emit('chatMessage', {
+                    id: 'system',
+                    name: 'System',
+                    username: 'System',
+                    message: 'Fly mode enabled',
+                    timestamp: new Date().toLocaleTimeString()
+                });
+            }
+            // Notify client about fly state change
+            socket.emit('flyStateChanged', { enabled: flyingPlayers.has(playerId) });
+            break;
+            
+        case '/bot':
+            if (!currentAdminStatus) {
+                socket.emit('chatMessage', {
+                    id: 'system',
+                    name: 'System',
+                    username: 'System',
+                    message: 'You do not have permission to use this command',
+                    timestamp: new Date().toLocaleTimeString()
+                });
+                return;
+            }
+            
+            if (args[1] === 'on') {
+                if (botEnabled) {
+                    socket.emit('chatMessage', {
+                        id: 'system',
+                        name: 'System',
+                        username: 'System',
+                        message: 'Bot is already enabled',
+                        timestamp: new Date().toLocaleTimeString()
+                    });
+                } else {
+                    botEnabled = true;
+                    startBot();
+                    socket.emit('chatMessage', {
+                        id: 'system',
+                        name: 'System',
+                        username: 'System',
+                        message: 'Bot enabled',
+                        timestamp: new Date().toLocaleTimeString()
+                    });
+                }
+            } else if (args[1] === 'off') {
+                if (!botEnabled) {
+                    socket.emit('chatMessage', {
+                        id: 'system',
+                        name: 'System',
+                        username: 'System',
+                        message: 'Bot is already disabled',
+                        timestamp: new Date().toLocaleTimeString()
+                    });
+                } else {
+                    botEnabled = false;
+                    stopBot();
+                    socket.emit('chatMessage', {
+                        id: 'system',
+                        name: 'System',
+                        username: 'System',
+                        message: 'Bot disabled',
+                        timestamp: new Date().toLocaleTimeString()
+                    });
+                }
+            } else {
+                socket.emit('chatMessage', {
+                    id: 'system',
+                    name: 'System',
+                    username: 'System',
+                    message: 'Usage: /bot on or /bot off',
+                    timestamp: new Date().toLocaleTimeString()
+                });
+            }
+            break;
+            
+        case '/kick':
+            if (!currentAdminStatus) {
+                socket.emit('chatMessage', {
+                    id: 'system',
+                    name: 'System',
+                    username: 'System',
+                    message: 'You do not have permission to use this command',
+                    timestamp: new Date().toLocaleTimeString()
+                });
+                return;
+            }
+            
+            if (!args[1]) {
+                socket.emit('chatMessage', {
+                    id: 'system',
+                    name: 'System',
+                    username: 'System',
+                    message: 'Usage: /kick <player>',
+                    timestamp: new Date().toLocaleTimeString()
+                });
+                return;
+            }
+            
+            // Find player by name
+            let targetPlayer = null;
+            let targetPlayerId = null;
+            for (const [id, p] of players.entries()) {
+                if (p.name && p.name.toLowerCase() === args[1].toLowerCase()) {
+                    targetPlayer = p;
+                    targetPlayerId = id;
+                    break;
+                }
+            }
+            
+            if (!targetPlayer) {
+                socket.emit('chatMessage', {
+                    id: 'system',
+                    name: 'System',
+                    username: 'System',
+                    message: `Player "${args[1]}" not found`,
+                    timestamp: new Date().toLocaleTimeString()
+                });
+                return;
+            }
+            
+            // Kick the player
+            const targetSocket = io.sockets.sockets.get(targetPlayerId);
+            if (targetSocket) {
+                targetSocket.emit('chatMessage', {
+                    id: 'system',
+                    name: 'System',
+                    username: 'System',
+                    message: 'You have been kicked from the server',
+                    timestamp: new Date().toLocaleTimeString()
+                });
+                targetSocket.disconnect();
+            }
+            
+            socket.emit('chatMessage', {
+                id: 'system',
+                name: 'System',
+                username: 'System',
+                message: `Kicked player "${args[1]}"`,
+                timestamp: new Date().toLocaleTimeString()
+            });
+            break;
+            
+        case '/tp':
+            if (!currentAdminStatus) {
+                socket.emit('chatMessage', {
+                    id: 'system',
+                    name: 'System',
+                    username: 'System',
+                    message: 'You do not have permission to use this command',
+                    timestamp: new Date().toLocaleTimeString()
+                });
+                return;
+            }
+            
+            if (args.length === 4) {
+                // Teleport to coordinates: /tp x y z
+                const x = parseFloat(args[1]);
+                const y = parseFloat(args[2]);
+                const z = parseFloat(args[3]);
+                
+                if (isNaN(x) || isNaN(y) || isNaN(z)) {
+                    socket.emit('chatMessage', {
+                        id: 'system',
+                        name: 'System',
+                        username: 'System',
+                        message: 'Usage: /tp <x> <y> <z> (numbers only)',
+                        timestamp: new Date().toLocaleTimeString()
+                    });
+                    return;
+                }
+                
+                socket.emit('teleport', { x, y, z });
+                socket.emit('chatMessage', {
+                    id: 'system',
+                    name: 'System',
+                    username: 'System',
+                    message: `Teleported to (${x}, ${y}, ${z})`,
+                    timestamp: new Date().toLocaleTimeString()
+                });
+            } else if (args.length === 2) {
+                // Teleport to player: /tp player
+                let targetPlayer = null;
+                let targetPlayerId = null;
+                for (const [id, p] of players.entries()) {
+                    if (p.name && p.name.toLowerCase() === args[1].toLowerCase()) {
+                        targetPlayer = p;
+                        targetPlayerId = id;
+                        break;
+                    }
+                }
+                
+                if (!targetPlayer) {
+                    socket.emit('chatMessage', {
+                        id: 'system',
+                        name: 'System',
+                        username: 'System',
+                        message: `Player "${args[1]}" not found`,
+                        timestamp: new Date().toLocaleTimeString()
+                    });
+                    return;
+                }
+                
+                socket.emit('teleport', {
+                    x: targetPlayer.position.x,
+                    y: targetPlayer.position.y,
+                    z: targetPlayer.position.z
+                });
+                socket.emit('chatMessage', {
+                    id: 'system',
+                    name: 'System',
+                    username: 'System',
+                    message: `Teleported to ${args[1]}`,
+                    timestamp: new Date().toLocaleTimeString()
+                });
+            } else {
+                socket.emit('chatMessage', {
+                    id: 'system',
+                    name: 'System',
+                    username: 'System',
+                    message: 'Usage: /tp <x> <y> <z> or /tp <player>',
+                    timestamp: new Date().toLocaleTimeString()
+                });
+            }
+            break;
+            
+        case '/give':
+            if (!currentAdminStatus) {
+                socket.emit('chatMessage', {
+                    id: 'system',
+                    name: 'System',
+                    username: 'System',
+                    message: 'You do not have permission to use this command',
+                    timestamp: new Date().toLocaleTimeString()
+                });
+                return;
+            }
+            
+            if (!args[1]) {
+                socket.emit('chatMessage', {
+                    id: 'system',
+                    name: 'System',
+                    username: 'System',
+                    message: 'Usage: /give <item> (sword, cheeseburger, soda, baseballbat, car)',
+                    timestamp: new Date().toLocaleTimeString()
+                });
+                return;
+            }
+            
+            const validItems = ['sword', 'cheeseburger', 'soda', 'baseballbat', 'car'];
+            const item = args[1].toLowerCase();
+            
+            if (!validItems.includes(item)) {
+                socket.emit('chatMessage', {
+                    id: 'system',
+                    name: 'System',
+                    username: 'System',
+                    message: `Invalid item. Valid items: ${validItems.join(', ')}`,
+                    timestamp: new Date().toLocaleTimeString()
+                });
+                return;
+            }
+            
+            socket.emit('giveItem', { item });
+            socket.emit('chatMessage', {
+                id: 'system',
+                name: 'System',
+                username: 'System',
+                message: `Gave yourself ${item}`,
+                timestamp: new Date().toLocaleTimeString()
+            });
+            break;
+            
+        case '/heal':
+            if (!currentAdminStatus) {
+                socket.emit('chatMessage', {
+                    id: 'system',
+                    name: 'System',
+                    username: 'System',
+                    message: 'You do not have permission to use this command',
+                    timestamp: new Date().toLocaleTimeString()
+                });
+                return;
+            }
+            
+            if (args[1]) {
+                // Heal another player
+                let targetPlayer = null;
+                let targetPlayerId = null;
+                for (const [id, p] of players.entries()) {
+                    if (p.name && p.name.toLowerCase() === args[1].toLowerCase()) {
+                        targetPlayer = p;
+                        targetPlayerId = id;
+                        break;
+                    }
+                }
+                
+                if (!targetPlayer) {
+                    socket.emit('chatMessage', {
+                        id: 'system',
+                        name: 'System',
+                        username: 'System',
+                        message: `Player "${args[1]}" not found`,
+                        timestamp: new Date().toLocaleTimeString()
+                    });
+                    return;
+                }
+                
+                const targetSocket = io.sockets.sockets.get(targetPlayerId);
+                if (targetSocket) {
+                    targetSocket.emit('healPlayer');
+                    socket.emit('chatMessage', {
+                        id: 'system',
+                        name: 'System',
+                        username: 'System',
+                        message: `Healed ${args[1]}`,
+                        timestamp: new Date().toLocaleTimeString()
+                    });
+                    targetSocket.emit('chatMessage', {
+                        id: 'system',
+                        name: 'System',
+                        username: 'System',
+                        message: 'You have been healed',
+                        timestamp: new Date().toLocaleTimeString()
+                    });
+                }
+            } else {
+                // Heal self
+                socket.emit('healPlayer');
+                socket.emit('chatMessage', {
+                    id: 'system',
+                    name: 'System',
+                    username: 'System',
+                    message: 'Health restored to full',
+                    timestamp: new Date().toLocaleTimeString()
+                });
+            }
+            break;
+            
+        case '/kill':
+            if (!currentAdminStatus) {
+                socket.emit('chatMessage', {
+                    id: 'system',
+                    name: 'System',
+                    username: 'System',
+                    message: 'You do not have permission to use this command',
+                    timestamp: new Date().toLocaleTimeString()
+                });
+                return;
+            }
+            
+            if (args[1]) {
+                // Kill another player
+                let targetPlayer = null;
+                let targetPlayerId = null;
+                for (const [id, p] of players.entries()) {
+                    if (p.name && p.name.toLowerCase() === args[1].toLowerCase()) {
+                        targetPlayer = p;
+                        targetPlayerId = id;
+                        break;
+                    }
+                }
+                
+                if (!targetPlayer) {
+                    socket.emit('chatMessage', {
+                        id: 'system',
+                        name: 'System',
+                        username: 'System',
+                        message: `Player "${args[1]}" not found`,
+                        timestamp: new Date().toLocaleTimeString()
+                    });
+                    return;
+                }
+                
+                const targetSocket = io.sockets.sockets.get(targetPlayerId);
+                if (targetSocket) {
+                    targetSocket.emit('killPlayer');
+                    socket.emit('chatMessage', {
+                        id: 'system',
+                        name: 'System',
+                        username: 'System',
+                        message: `Killed ${args[1]}`,
+                        timestamp: new Date().toLocaleTimeString()
+                    });
+                    targetSocket.emit('chatMessage', {
+                        id: 'system',
+                        name: 'System',
+                        username: 'System',
+                        message: 'You have been killed',
+                        timestamp: new Date().toLocaleTimeString()
+                    });
+                }
+            } else {
+                // Kill self
+                socket.emit('killPlayer');
+                socket.emit('chatMessage', {
+                    id: 'system',
+                    name: 'System',
+                    username: 'System',
+                    message: 'You killed yourself',
+                    timestamp: new Date().toLocaleTimeString()
+                });
+            }
+            break;
+            
+        case '/admin':
+            if (!currentAdminStatus) {
+                socket.emit('chatMessage', {
+                    id: 'system',
+                    name: 'System',
+                    username: 'System',
+                    message: 'You do not have permission to use this command',
+                    timestamp: new Date().toLocaleTimeString()
+                });
+                return;
+            }
+            
+            if (!args[1]) {
+                socket.emit('chatMessage', {
+                    id: 'system',
+                    name: 'System',
+                    username: 'System',
+                    message: 'Usage: /admin <player>',
+                    timestamp: new Date().toLocaleTimeString()
+                });
+                return;
+            }
+            
+            const targetUsername = args[1];
+            
+            // Check if account exists
+            if (!accounts[targetUsername]) {
+                socket.emit('chatMessage', {
+                    id: 'system',
+                    name: 'System',
+                    username: 'System',
+                    message: `Account "${targetUsername}" not found. Player must be registered (not a guest).`,
+                    timestamp: new Date().toLocaleTimeString()
+                });
+                return;
+            }
+            
+            // Make player admin
+            accounts[targetUsername].isAdmin = true;
+            saveData(); // Save to file
+            
+            // If player is currently online, update their admin status
+            for (const [id, p] of players.entries()) {
+                if (p.name && p.name.toLowerCase() === targetUsername.toLowerCase()) {
+                    // Update admin status in Map
+                    adminStatus.set(id, true);
+                    // Update player object
+                    p.isAdmin = true;
+                    const targetSocket = io.sockets.sockets.get(id);
+                    if (targetSocket) {
+                        // Update admin status for this session
+                        targetSocket.emit('adminStatusChanged', { isAdmin: true });
+                    }
+                }
+            }
+            
+            socket.emit('chatMessage', {
+                id: 'system',
+                name: 'System',
+                username: 'System',
+                message: `Made ${targetUsername} an admin`,
+                timestamp: new Date().toLocaleTimeString()
+            });
+            break;
+            
+        default:
+            socket.emit('chatMessage', {
+                id: 'system',
+                name: 'System',
+                username: 'System',
+                message: `Unknown command: ${command}. Type /help for available commands.`,
+                timestamp: new Date().toLocaleTimeString()
+            });
+    }
+}
+
+// Bot management
+function startBot() {
+    if (botSocket) {
+        return; // Bot already running
+    }
+    
+    // Import bot module dynamically
+    import('./bot.js').then(botModule => {
+        botModule.startBot('http://localhost:3000', (socket) => {
+            botSocket = socket; // Store bot socket reference
+        });
+    }).catch(err => {
+        console.error('Failed to start bot:', err);
+    });
+}
+
+function stopBot() {
+    if (botSocket) {
+        botSocket.disconnect();
+        botSocket = null;
+    }
+}
 
 httpServer.listen(PORT, () => {
     console.log(`Server running on http://localhost:${PORT}`);

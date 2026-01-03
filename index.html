@@ -65,18 +65,20 @@
                         <div class="form-group">
                             <label>Body Color:</label>
                             <div id="color-picker">
-                                <div class="color-option" data-color="0x4a9eff" style="background: #4a9eff;"></div>
-                                <div class="color-option" data-color="0xff6b6b" style="background: #ff6b6b;"></div>
-                                <div class="color-option" data-color="0x51cf66" style="background: #51cf66;"></div>
-                                <div class="color-option" data-color="0xffd93d" style="background: #ffd93d;"></div>
-                                <div class="color-option" data-color="0xa78bfa" style="background: #a78bfa;"></div>
-                                <div class="color-option" data-color="0xfb7185" style="background: #fb7185;"></div>
-                                <div class="color-option" data-color="0x60a5fa" style="background: #60a5fa;"></div>
-                                <div class="color-option" data-color="0x34d399" style="background: #34d399;"></div>
-                                <div class="color-option" data-color="0xfbbf24" style="background: #fbbf24;"></div>
-                                <div class="color-option" data-color="0xf472b6" style="background: #f472b6;"></div>
-                                <div class="color-option" data-color="0x818cf8" style="background: #818cf8;"></div>
+                                <div class="color-option" data-color="0x0066ff" style="background: #0066ff;"></div>
+                                <div class="color-option" data-color="0xff3333" style="background: #ff3333;"></div>
+                                <div class="color-option" data-color="0x00ff66" style="background: #00ff66;"></div>
+                                <div class="color-option" data-color="0xffdd00" style="background: #ffdd00;"></div>
+                                <div class="color-option" data-color="0x9966ff" style="background: #9966ff;"></div>
+                                <div class="color-option" data-color="0xff66cc" style="background: #ff66cc;"></div>
+                                <div class="color-option" data-color="0x00ccff" style="background: #00ccff;"></div>
+                                <div class="color-option" data-color="0x00ff99" style="background: #00ff99;"></div>
+                                <div class="color-option" data-color="0xff9900" style="background: #ff9900;"></div>
+                                <div class="color-option" data-color="0xff66ff" style="background: #ff66ff;"></div>
+                                <div class="color-option" data-color="0x6666ff" style="background: #6666ff;"></div>
                                 <div class="color-option" data-color="0xffffff" style="background: #ffffff; border: 2px solid #ccc;"></div>
+                                <div class="color-option" data-color="0x1a1a1a" style="background: #1a1a1a;"></div>
+                                <div class="color-option" data-color="0x505050" style="background: #505050;"></div>
                             </div>
                         </div>
                         <div class="form-group" id="hat-group">
@@ -134,6 +136,18 @@
         </div>
         <canvas id="game-canvas"></canvas>
     </div>
+    
+    <!-- Help Window -->
+    <div id="help-window" style="display: none;">
+        <div class="help-window-content">
+            <div class="help-window-header">
+                <h2>Commands</h2>
+                <button id="help-window-close" class="help-close-btn">×</button>
+            </div>
+            <div id="help-content" class="help-content"></div>
+        </div>
+    </div>
+    
     <script src="https://cdn.socket.io/4.6.1/socket.io.min.js"></script>
     <script type="importmap">
         {

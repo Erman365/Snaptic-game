@@ -9,7 +9,7 @@ let blocks = new Map();
 let selectedBlockType = 'dirt';
 let blocksInventoryOpen = true; // Block inventory (building menu) visibility
 let buildMode = 'build'; // 'build', 'delete', or null (nothing mode for items)
-let moveState = { forward: false, backward: false, left: false, right: false, jump: false, sprint: false };
+let moveState = { forward: false, backward: false, left: false, right: false, jump: false, sprint: false, flyDown: false };
 let velocity = new THREE.Vector3();
 let canJump = false;
 let prevTime = performance.now();
@@ -17,9 +17,10 @@ let playerName = 'Player';
 let isRagdoll = false;
 let ragdollTime = 0;
 let lastGroundY = 0; // Track last ground Y position for fall detection
-let playerColor = 0x4a9eff;
+let playerColor = 0x0066ff;
 let playerHat = 'none';
 let playerCape = 'none';
+let isFlying = false; // Fly mode state
 
 // Inventory and combat system
 let inventory = ['sword', 'cheeseburger', 'soda', 'baseballbat', 'car'];
@@ -194,6 +195,7 @@ function init() {
     setupBuildingMenu();
     setupLoginScreen();
     setupPauseMenu();
+    setupHelpWindow();
 
     // Start animation loop (game will start after login)
     animate();
@@ -699,19 +701,28 @@ function animateCape(cape, player, delta) {
     let isSprinting = false;
     
     if (player === localPlayer && velocity) {
-        playerVelocity = velocity.clone();
+        // Use velocity directly without cloning to reduce allocations
+        playerVelocity.x = velocity.x;
+        playerVelocity.y = velocity.y;
+        playerVelocity.z = velocity.z;
         moveSpeed = Math.sqrt(velocity.x * velocity.x + velocity.z * velocity.z);
         isMoving = moveSpeed > 0.01;
         isSprinting = moveState.sprint;
     } else if (player.userData.lastPosition) {
-        const currentPos = player.position.clone();
-        const vel = currentPos.sub(player.userData.lastPosition);
-        moveSpeed = vel.length() / (delta || 0.016);
-        playerVelocity = vel.clone().divideScalar(delta || 0.016);
+        // Calculate velocity without creating unnecessary Vector3 objects
+        const dx = player.position.x - player.userData.lastPosition.x;
+        const dy = player.position.y - player.userData.lastPosition.y;
+        const dz = player.position.z - player.userData.lastPosition.z;
+        const dt = delta || 0.016;
+        moveSpeed = Math.sqrt(dx * dx + dz * dz) / dt;
+        // Store velocity as simple values instead of Vector3
+        playerVelocity.x = dx / dt;
+        playerVelocity.y = dy / dt;
+        playerVelocity.z = dz / dt;
         isMoving = moveSpeed > 0.01;
         isSprinting = player.userData.isSprinting || false;
-        player.userData.lastPosition = player.position.clone();
     } else {
+        // Initialize lastPosition if not set
         player.userData.lastPosition = player.position.clone();
     }
     
@@ -752,34 +763,34 @@ function animateCape(cape, player, delta) {
             }
         } else {
             // For other players, calculate from velocity direction relative to player's facing
+            // Simplified calculation without expensive Vector3 operations
             const playerRotation = player.rotation.y;
-            const cosY = Math.cos(-playerRotation);
-            const sinY = Math.sin(-playerRotation);
+            const cosY = Math.cos(playerRotation);
+            const sinY = Math.sin(playerRotation);
             
-            // Local velocity: X = left/right (strafing), Z = forward/back
+            // Transform world velocity to local space (relative to player's facing direction)
             const localVelX = playerVelocity.x * cosY - playerVelocity.z * sinY;
             const localVelZ = playerVelocity.x * sinY + playerVelocity.z * cosY;
             
             // Check if moving backward (negative localVelZ means backward)
             isMovingBackward = localVelZ < -0.1;
             
-            // Check if strafing (significant lateral movement)
+            // Check if strafing (simplified check)
             const strafeAmount = Math.abs(localVelX);
             const forwardAmount = Math.abs(localVelZ);
             isStrafing = strafeAmount > 0.1 && strafeAmount > forwardAmount * 0.5;
             
             if (isStrafing) {
-                strafeDirection = localVelX > 0 ? 1 : -1;
+                strafeDirection = localVelX > 0 ? -1 : 1; // Inverted for correct visual
             }
         }
         
         // When moving forward: cape flows backward (pitch back)
         // When moving backward: cape doesn't pitch (can't go through body)
-        if (!isMovingBackward) {
-            const flowMultiplier = isSprinting ? 0.4 : 0.25; // More pivot when running
+        if (!isMovingBackward && !isStrafing) {
+            const flowMultiplier = isSprinting ? 0.4 : 0.25;
             targetRotationX = Math.min(moveSpeed * flowMultiplier, isSprinting ? 0.5 : 0.35);
         } else {
-            // When moving backward, keep cape neutral (no pitch back)
             targetRotationX = 0;
         }
         
@@ -787,14 +798,12 @@ function animateCape(cape, player, delta) {
         const baseSway = Math.sin(capeData.animationTime * animSpeed) * 0.12;
         
         // Strafing sway: only apply when actually strafing
-        // When strafing right, cape should sway right (positive rotation.z)
-        // When strafing left, cape should sway left (negative rotation.z)
         let strafeSway = 0;
         if (isStrafing) {
-            strafeSway = strafeDirection * 0.3; // Right strafe = right sway, left strafe = left sway
+            strafeSway = strafeDirection * 0.3;
         }
         
-        // Combine strafe sway with animation sway (only when strafing)
+        // Simplified: use strafe sway when strafing, otherwise base sway
         targetRotationZ = isStrafing ? strafeSway : baseSway;
     } else {
         // When idle: gentle swaying
@@ -1040,6 +1049,18 @@ function setupControls() {
             return; // Let the input handle the key
         }
         
+        // Press Enter to start chatting (if not already focused and help window is closed)
+        if (e.key === 'Enter') {
+            const chatInput = document.getElementById('chat-input');
+            const helpWindow = document.getElementById('help-window');
+            // Don't focus chat if help window is open
+            if (chatInput && !chatInput.disabled && (!helpWindow || helpWindow.style.display === 'none')) {
+                chatInput.focus();
+                e.preventDefault();
+                return;
+            }
+        }
+        
         switch(e.code) {
             case 'KeyW':
             case 'ArrowUp':
@@ -1058,10 +1079,18 @@ function setupControls() {
                 moveState.right = true;
                 break;
             case 'Space':
-                if (canJump) {
-                    velocity.y += 7.5; // Reduced jump by half
+                if (isFlying) {
+                    moveState.jump = true; // For fly mode (up)
+                } else if (canJump && !isFlying) {
+                    velocity.y += 9.5; // Increased jump height
                     canJump = false;
                     jumpAnimation(localPlayer);
+                }
+                e.preventDefault();
+                break;
+            case 'KeyX':
+                if (isFlying) {
+                    moveState.flyDown = true;
                 }
                 e.preventDefault();
                 break;
@@ -1316,6 +1345,12 @@ function setupControls() {
             case 'ShiftLeft':
             case 'ShiftRight':
                 moveState.sprint = false;
+                break;
+            case 'KeyX':
+                moveState.flyDown = false;
+                break;
+            case 'Space':
+                moveState.jump = false;
                 break;
             case 'ControlLeft':
             case 'ControlRight':
@@ -1618,9 +1653,11 @@ function setupChat() {
                 chatInput.value = '';
                 // Deselect chat input after sending
                 chatInput.blur();
+                e.preventDefault();
             } else {
                 // If Enter pressed with empty chat, focus the input
                 chatInput.focus();
+                e.preventDefault();
             }
             // Stop typing indicator
             if (socket && isTyping) {
@@ -1668,6 +1705,69 @@ function sendChatMessage(message) {
     if (socket) {
         socket.emit('chatMessage', message);
     }
+}
+
+// Show help window
+function showHelpWindow(isAdmin) {
+    const helpWindow = document.getElementById('help-window');
+    const helpContent = document.getElementById('help-content');
+    
+    if (!helpWindow || !helpContent) {
+        console.error('Help window elements not found!', { helpWindow: !!helpWindow, helpContent: !!helpContent });
+        return;
+    }
+    
+    console.log('Showing help window, isAdmin:', isAdmin);
+    
+    let html = '<h3>Available Commands</h3>';
+    html += '<div class="command"><span class="command-name">/help</span><span class="command-desc">- Show this help window</span></div>';
+    
+    if (isAdmin) {
+        html += '<h3>Admin Commands</h3>';
+        html += '<div class="command"><span class="command-name">/fly</span><span class="command-desc">- Toggle fly mode (Space = up, X = down)</span></div>';
+        html += '<div class="command"><span class="command-name">/bot on</span><span class="command-desc">- Enable bot player</span></div>';
+        html += '<div class="command"><span class="command-name">/bot off</span><span class="command-desc">- Disable bot player</span></div>';
+        html += '<div class="command"><span class="command-name">/kick &lt;player&gt;</span><span class="command-desc">- Kick a player from the server</span></div>';
+        html += '<div class="command"><span class="command-name">/tp &lt;x&gt; &lt;y&gt; &lt;z&gt;</span><span class="command-desc">- Teleport to coordinates</span></div>';
+        html += '<div class="command"><span class="command-name">/tp &lt;player&gt;</span><span class="command-desc">- Teleport to a player</span></div>';
+        html += '<div class="command"><span class="command-name">/give &lt;item&gt;</span><span class="command-desc">- Give yourself an item</span></div>';
+        html += '<div class="command"><span class="command-name">/heal [player]</span><span class="command-desc">- Restore full health (self or player)</span></div>';
+        html += '<div class="command"><span class="command-name">/kill [player]</span><span class="command-desc">- Kill yourself or a player</span></div>';
+        html += '<div class="command"><span class="command-name">/admin &lt;player&gt;</span><span class="command-desc">- Make a player an admin</span></div>';
+    }
+    
+    helpContent.innerHTML = html;
+    helpWindow.style.display = 'flex';
+}
+
+// Setup help window close button
+function setupHelpWindow() {
+    const helpWindow = document.getElementById('help-window');
+    const closeBtn = document.getElementById('help-window-close');
+    
+    if (!helpWindow || !closeBtn) {
+        console.warn('Help window elements not found');
+        return;
+    }
+    
+    closeBtn.addEventListener('click', () => {
+        helpWindow.style.display = 'none';
+    });
+    
+    // Close when clicking outside the window
+    helpWindow.addEventListener('click', (e) => {
+        if (e.target === helpWindow) {
+            helpWindow.style.display = 'none';
+        }
+    });
+    
+    // Close with Escape key (only if help window is open)
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' && helpWindow && helpWindow.style.display === 'flex') {
+            helpWindow.style.display = 'none';
+            e.stopPropagation(); // Prevent other Escape handlers
+        }
+    });
 }
 
 function displayChatMessage(data) {
@@ -3964,6 +4064,11 @@ let previewAnimationId = null;
 function setupLoginScreen() {
     // Connect to server first
     if (!socket || !socket.connected) {
+        // Disconnect old socket if it exists
+        if (socket) {
+            socket.removeAllListeners();
+            socket.disconnect();
+        }
         socket = io();
     }
 
@@ -4046,14 +4151,16 @@ function setupLoginScreen() {
             
             // Load character data if available
             if (data.characterData) {
-                playerColor = data.characterData.color || 0x4a9eff;
+                playerColor = data.characterData.color || 0x0066ff;
                 playerHat = data.characterData.hat || 'none';
+                playerCape = data.characterData.cape || 'none';
                 if (data.characterData.position) {
                     window.savedCharacterPosition = data.characterData.position;
                 }
             } else if (isGuest) {
-                playerColor = 0x4a9eff;
+                playerColor = 0x0066ff;
                 playerHat = 'none';
+                playerCape = 'none';
             }
             
             // Show customization
@@ -4184,7 +4291,8 @@ function setupLoginScreen() {
                 socket.emit('playerCustomization', {
                     name: playerName,
                     color: playerColor,
-                    hat: isGuest ? 'none' : playerHat
+                    hat: isGuest ? 'none' : playerHat,
+                    cape: isGuest ? 'none' : playerCape
                 });
             } else {
                 // Wait for connection
@@ -4192,7 +4300,8 @@ function setupLoginScreen() {
                     socket.emit('playerCustomization', {
                         name: playerName,
                         color: playerColor,
-                        hat: isGuest ? 'none' : playerHat
+                        hat: isGuest ? 'none' : playerHat,
+                        cape: isGuest ? 'none' : playerCape
                     });
                 });
             }
@@ -4209,7 +4318,7 @@ function setupLoginScreen() {
     });
 
     // Set default selections
-    document.querySelector('.color-option[data-color="0x4a9eff"]')?.classList.add('selected');
+    document.querySelector('.color-option[data-color="0x0066ff"]')?.classList.add('selected');
     document.querySelector('.hat-option[data-hat="none"]')?.classList.add('selected');
 }
 
@@ -4732,15 +4841,36 @@ function returnToMenu() {
     previewCamera = null;
     previewStickman = null;
     
-    // Reconnect socket and re-setup login screen
-    socket = io();
-    setupLoginScreen();
-    
-    // Show login screen
-    document.getElementById('login-screen').style.display = 'flex';
-    
-    // Clean up game state
+    // Clean up game state FIRST (before reconnecting socket)
     if (localPlayer) {
+        // Remove cape if it exists (check both possible property names)
+        if (localPlayer.userData.capeMesh) {
+            const capeMesh = localPlayer.userData.capeMesh;
+            if (capeMesh.parent) {
+                scene.remove(capeMesh);
+            }
+            // Dispose cape geometry and materials
+            capeMesh.traverse((child) => {
+                if (child instanceof THREE.Mesh) {
+                    if (child.geometry) child.geometry.dispose();
+                    if (child.material) {
+                        if (Array.isArray(child.material)) {
+                            child.material.forEach(m => m.dispose());
+                        } else {
+                            child.material.dispose();
+                        }
+                    }
+                }
+            });
+            localPlayer.userData.capeMesh = null;
+        }
+        if (localPlayer.userData.cape) {
+            if (localPlayer.userData.cape.parent) {
+                scene.remove(localPlayer.userData.cape);
+            }
+            localPlayer.userData.cape = null;
+        }
+        
         // Remove local player's UI elements
         if (localPlayer.userData.speechBubble && localPlayer.userData.speechBubble.parentNode) {
             localPlayer.userData.speechBubble.parentNode.removeChild(localPlayer.userData.speechBubble);
@@ -4751,9 +4881,62 @@ function returnToMenu() {
         if (localPlayer.userData.healthBar && localPlayer.userData.healthBar.parentNode) {
             localPlayer.userData.healthBar.parentNode.removeChild(localPlayer.userData.healthBar);
         }
-        scene.remove(localPlayer);
+        
+        // Remove from any cars
+        if (currentCar) {
+            currentCar = null;
+            carSeatIndex = -1;
+        }
+        
+        // Properly dispose of the player object
+        localPlayer.traverse((child) => {
+            if (child instanceof THREE.Mesh) {
+                if (child.geometry) child.geometry.dispose();
+                if (child.material) {
+                    if (Array.isArray(child.material)) {
+                        child.material.forEach(m => m.dispose());
+                    } else {
+                        child.material.dispose();
+                    }
+                }
+            }
+        });
+        
+        // Force remove from scene (check if it's actually in the scene)
+        if (localPlayer.parent) {
+            scene.remove(localPlayer);
+        }
+        
+        // Also try removing directly from scene children array as a fallback
+        const index = scene.children.indexOf(localPlayer);
+        if (index !== -1) {
+            scene.children.splice(index, 1);
+        }
+        
+        // Clear all userData references
+        Object.keys(localPlayer.userData).forEach(key => {
+            delete localPlayer.userData[key];
+        });
+        
+        // Make sure player is not visible
+        localPlayer.visible = false;
+        
         localPlayer = null;
     }
+    
+    // Clear any existing socket listeners before reconnecting
+    if (socket) {
+        socket.removeAllListeners();
+        socket.disconnect();
+        socket = null;
+    }
+    
+    // Reconnect socket and re-setup login screen
+    socket = io();
+    setupLoginScreen();
+    
+    // Show login screen
+    document.getElementById('login-screen').style.display = 'flex';
     
     // Remove other players and their UI elements
     otherPlayers.forEach((player) => {
@@ -4775,9 +4958,34 @@ function returnToMenu() {
     
     // Remove all blocks from the scene
     blocks.forEach((block) => {
-        scene.remove(block);
+        if (block.parent) {
+            scene.remove(block);
+        }
     });
     blocks.clear();
+    
+    // Remove all cars from the scene
+    cars.forEach((car) => {
+        if (car.parent) {
+            scene.remove(car);
+        }
+        // Dispose car geometry and materials
+        car.traverse((child) => {
+            if (child instanceof THREE.Mesh) {
+                if (child.geometry) child.geometry.dispose();
+                if (child.material) {
+                    if (Array.isArray(child.material)) {
+                        child.material.forEach(m => m.dispose());
+                    } else {
+                        child.material.dispose();
+                    }
+                }
+            }
+        });
+    });
+    cars.clear();
+    currentCar = null;
+    carSeatIndex = -1;
     
     // Remove local health bar UI if present
     const localHealthBar = document.getElementById('local-health-bar');
@@ -4785,8 +4993,13 @@ function returnToMenu() {
         localHealthBar.parentNode.removeChild(localHealthBar);
     }
     
-    // Reset health
+    // Reset health and game state
     playerHealth = maxHealth;
+    velocity.set(0, 0, 0);
+    canJump = false;
+    isFlying = false;
+    isRagdoll = false;
+    moveState = { forward: false, backward: false, left: false, right: false, jump: false, sprint: false, flyDown: false };
 }
 
 // Kill player (reset)
@@ -4901,8 +5114,12 @@ function connectToServer() {
         const player = otherPlayers.get(data.id);
         if (player) {
             const oldPos = player.position.clone();
-            // Store last position for cape physics
+            // Store last position for cape physics (before updating position)
+            // This ensures animateCape can calculate velocity correctly
             if (!player.userData.lastPosition) {
+                player.userData.lastPosition = oldPos.clone();
+            } else {
+                // Update lastPosition to the position before this update
                 player.userData.lastPosition = oldPos.clone();
             }
             player.position.set(data.position.x, data.position.y, data.position.z);
@@ -5009,6 +5226,44 @@ function connectToServer() {
 
     socket.on('chatMessage', (data) => {
         displayChatMessage(data);
+    });
+    
+    socket.on('showHelpWindow', (data) => {
+        showHelpWindow(data.isAdmin);
+    });
+    
+    socket.on('flyStateChanged', (data) => {
+        isFlying = data.enabled;
+        if (isFlying) {
+            // When enabling fly, stop vertical velocity
+            velocity.y = 0;
+        }
+    });
+    
+    socket.on('teleport', (data) => {
+        if (localPlayer) {
+            localPlayer.position.set(data.x, data.y, data.z);
+        }
+    });
+    
+    socket.on('giveItem', (data) => {
+        if (data.item && !inventory.includes(data.item)) {
+            inventory.push(data.item);
+            updateInventoryUI();
+        }
+    });
+    
+    socket.on('healPlayer', () => {
+        playerHealth = maxHealth;
+        updateHealthBar();
+    });
+    
+    socket.on('killPlayer', () => {
+        playerHealth = 0;
+        updateHealthBar();
+        if (localPlayer) {
+            localPlayer.visible = false;
+        }
     });
 
     socket.on('blockPlaced', (blockData) => {
@@ -5444,8 +5699,8 @@ function updatePlayerMovement(delta) {
         }
     }
     
-    // Apply gravity (only if not dead)
-    if (!isRagdoll && playerHealth > 0) {
+    // Apply gravity (only if not dead and not flying)
+    if (!isRagdoll && playerHealth > 0 && !isFlying) {
         if (onLadder) {
             // On ladder: slow descent when not holding W
             if (!moveState.forward) {
@@ -5454,6 +5709,15 @@ function updatePlayerMovement(delta) {
         } else {
             // Not on ladder: normal gravity
             velocity.y -= 30 * delta; // Normal gravity
+        }
+    } else if (isFlying && !isRagdoll && playerHealth > 0) {
+        // Fly mode: allow vertical movement with Space (up) and X (down)
+        if (moveState.jump) {
+            velocity.y = 150 * delta; // Fly up
+        } else if (moveState.flyDown) {
+            velocity.y = -150 * delta; // Fly down
+        } else {
+            velocity.y = 0; // Hover
         }
     } else if (playerHealth <= 0) {
         // Ensure velocity is zero when dead
@@ -5501,8 +5765,14 @@ function updatePlayerMovement(delta) {
             localPlayer.position.z + playerRadius > blockMin.z &&
             localPlayer.position.z - playerRadius < blockMax.z);
         
-        // Handle special blocks
-        if (horizontalOverlap) {
+        // Check vertical overlap (player must be touching the block vertically)
+        const playerHeight = 1.8; // Approximate player height
+        const playerBottom = localPlayer.position.y - 0.3; // Feet position
+        const playerTop = localPlayer.position.y + playerHeight - 0.3;
+        const verticalOverlap = (playerTop > blockMin.y && playerBottom < blockMax.y);
+        
+        // Handle special blocks (only if both horizontal AND vertical overlap)
+        if (horizontalOverlap && verticalOverlap) {
             // Kill block - instant death (with cooldown to prevent repeated deaths)
             if (blockType === 'kill') {
                 // Only trigger if player is alive and not already in death animation
