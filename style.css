@@ -47,6 +47,52 @@ body {
     pointer-events: none;
 }
 
+#voice-chat-controls {
+    position: absolute;
+    top: 20px;
+    right: 20px;
+    pointer-events: auto;
+    z-index: 100;
+}
+
+.mic-button {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 16px;
+    background: rgba(0, 0, 0, 0.7);
+    border: 2px solid rgba(255, 255, 255, 0.3);
+    border-radius: 25px;
+    color: #fff;
+    font-size: 14px;
+    font-weight: bold;
+    cursor: pointer;
+    transition: all 0.3s ease;
+}
+
+.mic-button:hover {
+    background: rgba(0, 0, 0, 0.9);
+    border-color: rgba(255, 255, 255, 0.5);
+}
+
+.mic-button.active {
+    background: rgba(76, 175, 80, 0.8);
+    border-color: rgba(76, 175, 80, 1);
+}
+
+.mic-button.muted {
+    background: rgba(244, 67, 54, 0.8);
+    border-color: rgba(244, 67, 54, 1);
+}
+
+#mic-icon {
+    font-size: 18px;
+}
+
+#mic-status {
+    font-size: 12px;
+}
+
 #chat-container {
     position: absolute;
     bottom: 100px;
@@ -552,6 +598,99 @@ button:hover {
     flex: 1;
     min-width: 250px;
     max-width: 400px;
+}
+
+/* Emote Menu - Circular Layout */
+#emote-menu {
+    position: fixed;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    width: 400px;
+    height: 400px;
+    pointer-events: auto;
+    z-index: 1000;
+}
+
+.emote-menu-center {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    width: 80px;
+    height: 80px;
+    background: rgba(0, 0, 0, 0.8);
+    border: 3px solid rgba(255, 255, 255, 0.5);
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 10;
+}
+
+.emote-menu-label {
+    color: #fff;
+    font-size: 14px;
+    font-weight: bold;
+    text-align: center;
+}
+
+.emote-item {
+    position: absolute;
+    width: 100px;
+    height: 100px;
+    background: rgba(0, 0, 0, 0.8);
+    border: 3px solid rgba(255, 255, 255, 0.3);
+    border-radius: 50%;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    transform: translate(-50%, -50%);
+}
+
+.emote-item:hover {
+    background: rgba(0, 0, 0, 0.95);
+    border-color: rgba(255, 255, 255, 0.6);
+    transform: translate(-50%, -50%) scale(1.1);
+}
+
+.emote-item.selected {
+    background: rgba(76, 175, 80, 0.8);
+    border-color: rgba(76, 175, 80, 1);
+}
+
+.emote-key {
+    color: #fff;
+    font-size: 24px;
+    font-weight: bold;
+    margin-bottom: 5px;
+    text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.8);
+}
+
+.emote-name {
+    color: #fff;
+    font-size: 12px;
+    text-align: center;
+    text-shadow: 1px 1px 2px rgba(0, 0, 0, 0.8);
+}
+
+/* Position emotes in a circle - 3 items evenly spaced */
+.emote-item[data-emote="point"] {
+    top: 15%;
+    left: 50%;
+}
+
+.emote-item[data-emote="wave"] {
+    top: 70%;
+    left: 20%;
+}
+
+.emote-item[data-emote="gangnam"] {
+    top: 70%;
+    left: 80%;
 }
 
 

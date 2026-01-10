@@ -4,5 +4,13 @@
     "passwordHash": "25bed0b5f9af923aaa929ee5762929bf01e8262095967e69cfe12c0218850510",
     "isAdmin": true,
     "createdAt": "2025-12-27T10:57:09.820Z"
+  },
+  "Erman": {
+    "passwordHash": "91eaf9a6a5782d34f934c8293b6c08578dfba054830b1ff43e633dc61b60f503",
+    "isAdmin": true
+  },
+  "lui": {
+    "passwordHash": "6228a5849d36b3c1b8e61eab0d743424ef03fb5fad490988a60b6aba1ab1ac4b",
+    "isAdmin": false
   }
 }

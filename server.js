@@ -44,8 +44,15 @@ function loadData() {
 }
 
 function saveData() {
-    fs.writeFileSync(ACCOUNTS_FILE, JSON.stringify(accounts, null, 2));
-    fs.writeFileSync(CHARACTERS_FILE, JSON.stringify(characters, null, 2));
+    try {
+        fs.writeFileSync(ACCOUNTS_FILE, JSON.stringify(accounts, null, 2));
+        fs.writeFileSync(CHARACTERS_FILE, JSON.stringify(characters, null, 2));
+        console.log('Data saved successfully');
+    } catch (error) {
+        console.error('Error saving data:', error);
+        // On Render, filesystem is ephemeral - data will be lost on restart
+        // Consider using a database or persistent storage service for production
+    }
 }
 
 function hashPassword(password) {
@@ -72,6 +79,8 @@ let botEnabled = false; // Bot state
 let botSocket = null; // Bot socket connection
 const flyingPlayers = new Set(); // Track players with fly enabled
 const adminStatus = new Map(); // Track admin status by socket ID (for immediate updates)
+const voiceChatEnabled = new Set(); // Track players with voice chat enabled
+const VOICE_CHAT_DISTANCE = 50; // Maximum distance for voice chat (in game units)
 
 // Helper function to generate unique ID
 function generateId() {
@@ -156,6 +165,7 @@ io.on('connection', (socket) => {
     players.set(playerId, {
         id: playerId,
         name: 'Player',
+        username: null, // Will be set during authentication/customization
         position: { x: 0, y: 5, z: 0 },
         rotation: { x: 0, y: 0, z: 0 },
         headRotation: { x: 0, y: 0, z: 0 },
@@ -169,6 +179,7 @@ io.on('connection', (socket) => {
         const player = players.get(playerId);
         if (player) {
             player.name = data.name || 'Player';
+            player.username = playerUsername; // Store username for command lookups
             player.color = data.color || 0x0066ff;
             player.hat = data.hat || 'none';
             player.cape = data.cape || 'none';
@@ -512,6 +523,18 @@ io.on('connection', (socket) => {
     });
 
     // Handle typing indicator
+    // Handle player emotes
+    socket.on('playerEmote', (data) => {
+        const player = players.get(playerId);
+        if (player) {
+            // Broadcast emote to all other players
+            socket.broadcast.emit('playerEmote', {
+                id: playerId,
+                emote: data.emote || null
+            });
+        }
+    });
+    
     socket.on('playerTyping', (isTyping) => {
         socket.broadcast.emit('playerTyping', {
             playerId: playerId,
@@ -519,15 +542,109 @@ io.on('connection', (socket) => {
         });
     });
 
+    // Voice chat handlers
+    socket.on('voiceChatReady', (data) => {
+        if (data.enabled) {
+            voiceChatEnabled.add(playerId);
+        } else {
+            voiceChatEnabled.delete(playerId);
+        }
+        // Update proximity for all players
+        updateVoiceChatProximity();
+    });
+    
+    // WebRTC signaling
+    socket.on('voiceChatOffer', (data) => {
+        const targetSocket = io.sockets.sockets.get(data.targetId);
+        if (targetSocket) {
+            targetSocket.emit('voiceChatOffer', {
+                fromId: playerId,
+                offer: data.offer
+            });
+        }
+    });
+    
+    socket.on('voiceChatAnswer', (data) => {
+        const targetSocket = io.sockets.sockets.get(data.targetId);
+        if (targetSocket) {
+            targetSocket.emit('voiceChatAnswer', {
+                fromId: playerId,
+                answer: data.answer
+            });
+        }
+    });
+    
+    socket.on('voiceChatIceCandidate', (data) => {
+        const targetSocket = io.sockets.sockets.get(data.targetId);
+        if (targetSocket) {
+            targetSocket.emit('voiceChatIceCandidate', {
+                fromId: playerId,
+                candidate: data.candidate
+            });
+        }
+    });
+    
     // Handle player disconnect
     socket.on('disconnect', () => {
         console.log('Player disconnected:', socket.id);
         players.delete(playerId);
         flyingPlayers.delete(playerId); // Remove from flying players
         adminStatus.delete(playerId); // Remove admin status
+        voiceChatEnabled.delete(playerId); // Remove from voice chat enabled
         socket.broadcast.emit('playerLeft', playerId);
+        // Update proximity for remaining players
+        updateVoiceChatProximity();
     });
 });
+
+// Update voice chat proximity for all players
+function updateVoiceChatProximity() {
+    // Only process players with voice chat enabled
+    const enabledPlayers = Array.from(voiceChatEnabled);
+    if (enabledPlayers.length < 2) {
+        // Not enough players for voice chat
+        return;
+    }
+    
+    // Calculate proximity for each player with voice chat enabled
+    enabledPlayers.forEach(playerId => {
+        const player = players.get(playerId);
+        if (!player || !player.position) return;
+        
+        const nearbyPlayers = [];
+        
+        enabledPlayers.forEach(otherPlayerId => {
+            if (otherPlayerId === playerId) return;
+            
+            const otherPlayer = players.get(otherPlayerId);
+            if (!otherPlayer || !otherPlayer.position) return;
+            
+            // Calculate distance between players
+            const dx = player.position.x - otherPlayer.position.x;
+            const dy = player.position.y - otherPlayer.position.y;
+            const dz = player.position.z - otherPlayer.position.z;
+            const distance = Math.sqrt(dx * dx + dy * dy + dz * dz);
+            
+            // If within range, add to nearby players
+            if (distance <= VOICE_CHAT_DISTANCE) {
+                nearbyPlayers.push(otherPlayerId);
+            }
+        });
+        
+        // Send proximity update to player
+        const socket = io.sockets.sockets.get(playerId);
+        if (socket) {
+            socket.emit('voiceChatPlayersNearby', {
+                nearbyPlayers: nearbyPlayers
+            });
+        }
+    });
+}
+
+// Update voice chat proximity periodically (every 500ms)
+setInterval(() => {
+    updateVoiceChatProximity();
+}, 500);
 
 // Command handler
 function handleCommand(socket, playerId, player, message, isAdmin) {
@@ -753,7 +870,10 @@ function handleCommand(socket, playerId, player, message, isAdmin) {
                 let targetPlayer = null;
                 let targetPlayerId = null;
                 for (const [id, p] of players.entries()) {
-                    if (p.name && p.name.toLowerCase() === args[1].toLowerCase()) {
+                    // Check both username and name for lookup
+                    const matchName = p.name && p.name.toLowerCase() === args[1].toLowerCase();
+                    const matchUsername = p.username && p.username.toLowerCase() === args[1].toLowerCase();
+                    if (matchName || matchUsername) {
                         targetPlayer = p;
                         targetPlayerId = id;
                         break;
@@ -858,7 +978,10 @@ function handleCommand(socket, playerId, player, message, isAdmin) {
                 let targetPlayer = null;
                 let targetPlayerId = null;
                 for (const [id, p] of players.entries()) {
-                    if (p.name && p.name.toLowerCase() === args[1].toLowerCase()) {
+                    // Check both username and name for lookup
+                    const matchName = p.name && p.name.toLowerCase() === args[1].toLowerCase();
+                    const matchUsername = p.username && p.username.toLowerCase() === args[1].toLowerCase();
+                    if (matchName || matchUsername) {
                         targetPlayer = p;
                         targetPlayerId = id;
                         break;
@@ -924,7 +1047,10 @@ function handleCommand(socket, playerId, player, message, isAdmin) {
                 let targetPlayer = null;
                 let targetPlayerId = null;
                 for (const [id, p] of players.entries()) {
-                    if (p.name && p.name.toLowerCase() === args[1].toLowerCase()) {
+                    // Check both username and name for lookup
+                    const matchName = p.name && p.name.toLowerCase() === args[1].toLowerCase();
+                    const matchUsername = p.username && p.username.toLowerCase() === args[1].toLowerCase();
+                    if (matchName || matchUsername) {
                         targetPlayer = p;
                         targetPlayerId = id;
                         break;
@@ -943,8 +1069,50 @@ function handleCommand(socket, playerId, player, message, isAdmin) {
                 }
                 
                 const targetSocket = io.sockets.sockets.get(targetPlayerId);
-                if (targetSocket) {
-                    targetSocket.emit('killPlayer');
+                if (targetSocket && targetPlayer) {
+                    // Set health to 0
+                    targetPlayer.health = 0;
+                    
+                    // Generate cube data for death explosion
+                    const cubeData = [];
+                    for (let i = 0; i < 30; i++) {
+                        const angle = (Math.PI * 2 * i) / 30;
+                        const radius = 0.3 + Math.random() * 0.4;
+                        const verticalAngle = (Math.random() - 0.3) * Math.PI * 0.4;
+                        
+                        cubeData.push({
+                            size: 0.3 + Math.random() * 0.3,
+                            offset: {
+                                x: (Math.random() - 0.5) * 0.5,
+                                y: Math.random() * 0.3,
+                                z: (Math.random() - 0.5) * 0.5
+                            },
+                            velocity: {
+                                x: Math.cos(angle) * radius * (6 + Math.random() * 4),
+                                y: Math.sin(verticalAngle) * (5 + Math.random() * 5) + 3,
+                                z: Math.sin(angle) * radius * (6 + Math.random() * 4)
+                            }
+                        });
+                    }
+                    
+                    // Broadcast death event (same as normal death)
+                    io.emit('playerDied', {
+                        playerId: targetPlayer.id,
+                        attackerId: playerId,
+                        deathPosition: targetPlayer.position,
+                        cubeData: cubeData
+                    });
+                    
+                    // Reset health and position after 5 seconds (same as normal death)
+                    setTimeout(() => {
+                        targetPlayer.health = 100;
+                        targetPlayer.position = { x: 0, y: 5, z: 0 };
+                        io.emit('playerRespawned', {
+                            playerId: targetPlayer.id,
+                            position: { x: 0, y: 5, z: 0 }
+                        });
+                    }, 5000);
+                    
                     socket.emit('chatMessage', {
                         id: 'system',
                         name: 'System',
@@ -961,8 +1129,52 @@ function handleCommand(socket, playerId, player, message, isAdmin) {
                     });
                 }
             } else {
-                // Kill self
-                socket.emit('killPlayer');
+                // Kill self - trigger normal death sequence
+                const player = players.get(playerId);
+                if (player) {
+                    player.health = 0;
+                    
+                    // Generate cube data for death explosion
+                    const cubeData = [];
+                    for (let i = 0; i < 30; i++) {
+                        const angle = (Math.PI * 2 * i) / 30;
+                        const radius = 0.3 + Math.random() * 0.4;
+                        const verticalAngle = (Math.random() - 0.3) * Math.PI * 0.4;
+                        
+                        cubeData.push({
+                            size: 0.3 + Math.random() * 0.3,
+                            offset: {
+                                x: (Math.random() - 0.5) * 0.5,
+                                y: Math.random() * 0.3,
+                                z: (Math.random() - 0.5) * 0.5
+                            },
+                            velocity: {
+                                x: Math.cos(angle) * radius * (6 + Math.random() * 4),
+                                y: Math.sin(verticalAngle) * (5 + Math.random() * 5) + 3,
+                                z: Math.sin(angle) * radius * (6 + Math.random() * 4)
+                            }
+                        });
+                    }
+                    
+                    // Broadcast death event
+                    io.emit('playerDied', {
+                        playerId: player.id,
+                        attackerId: player.id,
+                        deathPosition: player.position,
+                        cubeData: cubeData
+                    });
+                    
+                    // Reset health and position after 5 seconds
+                    setTimeout(() => {
+                        player.health = 100;
+                        player.position = { x: 0, y: 5, z: 0 };
+                        io.emit('playerRespawned', {
+                            playerId: player.id,
+                            position: { x: 0, y: 5, z: 0 }
+                        });
+                    }, 5000);
+                }
+                
                 socket.emit('chatMessage', {
                     id: 'system',
                     name: 'System',
@@ -1016,7 +1228,10 @@ function handleCommand(socket, playerId, player, message, isAdmin) {
             
             // If player is currently online, update their admin status
             for (const [id, p] of players.entries()) {
-                if (p.name && p.name.toLowerCase() === targetUsername.toLowerCase()) {
+                // Check both username and name for lookup
+                const matchName = p.name && p.name.toLowerCase() === targetUsername.toLowerCase();
+                const matchUsername = p.username && p.username.toLowerCase() === targetUsername.toLowerCase();
+                if (matchName || matchUsername) {
                     // Update admin status in Map
                     adminStatus.set(id, true);
                     // Update player object

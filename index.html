@@ -111,6 +111,12 @@
     <div id="game-container" style="display: none;">
         <div id="ui">
             <div id="score">Players: 1</div>
+            <div id="voice-chat-controls">
+                <button id="mic-toggle" class="mic-button" title="Toggle Microphone (V)">
+                    <span id="mic-icon">🎤</span>
+                    <span id="mic-status">Muted</span>
+                </button>
+            </div>
             <div id="chat-container">
                 <div id="chat-messages"></div>
                 <div id="chat-input-container">
@@ -132,6 +138,23 @@
             <div id="instructions">
                 <p><strong>WASD</strong> - Move | <strong>Shift</strong> - Sprint | <strong>Space</strong> - Jump | <strong>Right Click + Drag</strong> - Look around</p>
                 <p><strong>Q</strong> - Toggle Build/Delete/Item | <strong>R</strong> - Block Inventory | <strong>F</strong> - Item Inventory | <strong>Left Click</strong> - Place/Delete/Use</p>
+            </div>
+            <div id="emote-menu" style="display: none;">
+                <div class="emote-menu-center">
+                    <div class="emote-menu-label">Emotes</div>
+                </div>
+                <div class="emote-item" data-emote="point" data-key="1">
+                    <div class="emote-key">1</div>
+                    <div class="emote-name">Point</div>
+                </div>
+                <div class="emote-item" data-emote="wave" data-key="2">
+                    <div class="emote-key">2</div>
+                    <div class="emote-name">Wave</div>
+                </div>
+                <div class="emote-item" data-emote="gangnam" data-key="3">
+                    <div class="emote-key">3</div>
+                    <div class="emote-name">Gangnam Style</div>
+                </div>
             </div>
         </div>
         <canvas id="game-canvas"></canvas>

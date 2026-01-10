@@ -1,4 +1,6 @@
 import * as THREE from 'three';
+import { OBJExporter } from 'three/addons/exporters/OBJExporter.js';
+import { FBXLoader } from 'three/addons/loaders/FBXLoader.js';
 
 // Game state
 let scene, camera, renderer, controls;
@@ -55,6 +57,7 @@ const cameraHeight = 4;
 let cameraAngle = 0;
 let cameraPitch = 0.3;
 let cameraLocked = false; // Camera lock state
+let isFirstPerson = false; // First-person view state
 // Camera collision helpers
 const CAMERA_COLLISION_PADDING = 0.3; // How far from obstacles the camera should stay
 const cameraRaycaster = new THREE.Raycaster();
@@ -69,6 +72,35 @@ const DAMAGE_BLOCK_COOLDOWN = 1000; // 1 second cooldown between damage
 let killBlockCooldowns = new Map(); // Cooldown for kill blocks (blockKey -> timestamp)
 const KILL_BLOCK_COOLDOWN = 2000; // 2 second cooldown between kills
 let isDeathAnimationPlaying = false; // Track if death animation is currently playing
+
+// Voice chat system
+let voiceChatEnabled = false;
+let localStream = null;
+let peerConnections = new Map(); // playerId -> RTCPeerConnection
+let pendingIceCandidates = new Map(); // playerId -> Array of ICE candidates waiting for remote description
+// Audio elements removed - using Web Audio API only
+let audioContext = null;
+let gainNodes = new Map(); // playerId -> GainNode
+const VOICE_CHAT_DISTANCE = 50; // Maximum distance for voice chat (in game units)
+const VOICE_CHAT_MIN_VOLUME = 0.0; // Minimum volume at max distance (complete silence)
+const VOICE_CHAT_MAX_VOLUME = 1.0; // Maximum volume at close range
+
+// Emote system
+let currentEmote = null; // Current emote being performed (null, 'point', 'wave', 'gangnam')
+let emoteStartTime = 0; // When the current emote started
+let emoteMenuOpen = false; // Whether the emote menu is open
+let emoteAnimations = new Map(); // Store imported animations: emoteName -> AnimationClip
+let animationMixer = null; // THREE.AnimationMixer for playing imported animations
+const EMOTE_DURATIONS = {
+    point: 2.0, // 2 seconds for pointing
+    wave: 2.5, // 2.5 seconds for waving
+    gangnam: 15.0 // 15 seconds for Gangnam Style (will loop)
+};
+const EMOTES = [
+    { id: 'point', name: 'Point', key: '1' },
+    { id: 'wave', name: 'Wave', key: '2' },
+    { id: 'gangnam', name: 'Gangnam Style', key: '3' }
+];
 
 // Block types with colors
 const BLOCK_TYPES = {
@@ -192,7 +224,9 @@ function init() {
     // Setup controls
     setupControls();
     setupChat();
+    setupVoiceChat();
     setupBuildingMenu();
+    setupEmoteMenu();
     setupLoginScreen();
     setupPauseMenu();
     setupHelpWindow();
@@ -534,9 +568,422 @@ function createStickman(color = 0xffffff, hat = 'none', cape = 'none') {
     group.userData.speechBubble = null;
     group.userData.nameLabel = null;
     group.userData.animationTime = 0;
+    
+    // Create skeleton/bones for export and animation import
+    createBoneRig(group);
 
     return group;
 }
+
+// ==================== BONE RIGGING SYSTEM ====================
+
+// Create bone structure for the character (for export and animation import)
+function createBoneRig(character) {
+    if (!character.userData.body) return;
+    
+    // Create root bone
+    const rootBone = new THREE.Bone();
+    rootBone.position.set(0, 0.65, 0); // At body center
+    rootBone.name = 'Root';
+    
+    // Body bone
+    const bodyBone = new THREE.Bone();
+    bodyBone.position.set(0, 0, 0);
+    bodyBone.name = 'Body';
+    rootBone.add(bodyBone);
+    
+    // Head bone
+    const headBone = new THREE.Bone();
+    headBone.position.set(0, 0.78, 0); // Head position relative to body
+    headBone.name = 'Head';
+    bodyBone.add(headBone);
+    
+    // Left arm bones
+    const leftShoulderBone = new THREE.Bone();
+    leftShoulderBone.position.set(0.25, 0.35, -0.05);
+    leftShoulderBone.name = 'LeftShoulder';
+    bodyBone.add(leftShoulderBone);
+    
+    const leftUpperArmBone = new THREE.Bone();
+    leftUpperArmBone.position.set(0, -0.175, 0);
+    leftUpperArmBone.name = 'LeftUpperArm';
+    leftShoulderBone.add(leftUpperArmBone);
+    
+    const leftElbowBone = new THREE.Bone();
+    leftElbowBone.position.set(0, -0.175, 0);
+    leftElbowBone.name = 'LeftElbow';
+    leftUpperArmBone.add(leftElbowBone);
+    
+    const leftHandBone = new THREE.Bone();
+    leftHandBone.position.set(0, -0.075, 0);
+    leftHandBone.name = 'LeftHand';
+    leftElbowBone.add(leftHandBone);
+    
+    // Right arm bones
+    const rightShoulderBone = new THREE.Bone();
+    rightShoulderBone.position.set(-0.25, 0.35, -0.05);
+    rightShoulderBone.name = 'RightShoulder';
+    bodyBone.add(rightShoulderBone);
+    
+    const rightUpperArmBone = new THREE.Bone();
+    rightUpperArmBone.position.set(0, -0.175, 0);
+    rightUpperArmBone.name = 'RightUpperArm';
+    rightShoulderBone.add(rightUpperArmBone);
+    
+    const rightElbowBone = new THREE.Bone();
+    rightElbowBone.position.set(0, -0.175, 0);
+    rightElbowBone.name = 'RightElbow';
+    rightUpperArmBone.add(rightElbowBone);
+    
+    const rightHandBone = new THREE.Bone();
+    rightHandBone.position.set(0, -0.075, 0);
+    rightHandBone.name = 'RightHand';
+    rightElbowBone.add(rightHandBone);
+    
+    // Left leg bones
+    const leftHipBone = new THREE.Bone();
+    leftHipBone.position.set(-0.15, -0.15, 0.05);
+    leftHipBone.name = 'LeftHip';
+    bodyBone.add(leftHipBone);
+    
+    const leftThighBone = new THREE.Bone();
+    leftThighBone.position.set(0, -0.2, 0);
+    leftThighBone.name = 'LeftThigh';
+    leftHipBone.add(leftThighBone);
+    
+    const leftKneeBone = new THREE.Bone();
+    leftKneeBone.position.set(0, -0.2, 0);
+    leftKneeBone.name = 'LeftKnee';
+    leftThighBone.add(leftKneeBone);
+    
+    const leftFootBone = new THREE.Bone();
+    leftFootBone.position.set(0, -0.1, 0);
+    leftFootBone.name = 'LeftFoot';
+    leftKneeBone.add(leftFootBone);
+    
+    // Right leg bones
+    const rightHipBone = new THREE.Bone();
+    rightHipBone.position.set(0.15, -0.15, 0.05);
+    rightHipBone.name = 'RightHip';
+    bodyBone.add(rightHipBone);
+    
+    const rightThighBone = new THREE.Bone();
+    rightThighBone.position.set(0, -0.2, 0);
+    rightThighBone.name = 'RightThigh';
+    rightHipBone.add(rightThighBone);
+    
+    const rightKneeBone = new THREE.Bone();
+    rightKneeBone.position.set(0, -0.2, 0);
+    rightKneeBone.name = 'RightKnee';
+    rightThighBone.add(rightKneeBone);
+    
+    const rightFootBone = new THREE.Bone();
+    rightFootBone.position.set(0, -0.1, 0);
+    rightFootBone.name = 'RightFoot';
+    rightKneeBone.add(rightFootBone);
+    
+    // Create skeleton
+    const skeleton = new THREE.Skeleton([rootBone]);
+    character.userData.skeleton = skeleton;
+    character.userData.rootBone = rootBone;
+    
+    // Add root bone to character (needed for export)
+    character.add(rootBone);
+    rootBone.visible = false; // Hide bones in game
+    
+    // Store bone references for animation mapping
+    character.userData.bones = {
+        root: rootBone,
+        body: bodyBone,
+        head: headBone,
+        leftShoulder: leftShoulderBone,
+        leftUpperArm: leftUpperArmBone,
+        leftElbow: leftElbowBone,
+        leftHand: leftHandBone,
+        rightShoulder: rightShoulderBone,
+        rightUpperArm: rightUpperArmBone,
+        rightElbow: rightElbowBone,
+        rightHand: rightHandBone,
+        leftHip: leftHipBone,
+        leftThigh: leftThighBone,
+        leftKnee: leftKneeBone,
+        leftFoot: leftFootBone,
+        rightHip: rightHipBone,
+        rightThigh: rightThighBone,
+        rightKnee: rightKneeBone,
+        rightFoot: rightFootBone
+    };
+}
+
+// Export character model to OBJ (static mesh for reference)
+// Note: OBJ doesn't support bones, so this is just the mesh reference
+// For animation, you'll need to recreate the model in Blender/Maya with the same bone structure
+function exportCharacterModel(character, filename = 'character.obj') {
+    if (!character) {
+        console.error('No character to export.');
+        return;
+    }
+    
+    try {
+        const exporter = new OBJExporter();
+        const result = exporter.parse(character);
+        
+        // Create download link
+        const blob = new Blob([result], { type: 'text/plain' });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = filename;
+        link.click();
+        URL.revokeObjectURL(url);
+        
+        console.log('Character model exported as OBJ!');
+        console.log('Note: OBJ is static. For animations:');
+        console.log('1. Import this OBJ into Blender/Maya');
+        console.log('2. Create bones matching these names: Root, Body, Head, LeftShoulder, LeftUpperArm, LeftElbow, LeftHand, RightShoulder, RightUpperArm, RightElbow, RightHand, LeftHip, LeftThigh, LeftKnee, LeftFoot, RightHip, RightThigh, RightKnee, RightFoot');
+        console.log('3. Animate and export as FBX');
+        console.log('4. Use loadEmoteAnimation() to load the FBX file');
+    } catch (error) {
+        console.error('Failed to export model:', error);
+        alert('Export failed. Make sure OBJExporter is available.');
+    }
+}
+
+// Export bone structure as JSON (for reference when rigging)
+function exportBoneStructure(character, filename = 'bone_structure.json') {
+    if (!character || !character.userData.bones) {
+        console.error('Character does not have bones.');
+        return;
+    }
+    
+    const boneInfo = {
+        bones: {},
+        hierarchy: []
+    };
+    
+    function traverseBones(bone, parentName = null) {
+        const boneData = {
+            name: bone.name,
+            position: { x: bone.position.x, y: bone.position.y, z: bone.position.z },
+            parent: parentName
+        };
+        boneInfo.bones[bone.name] = boneData;
+        if (parentName) {
+            boneInfo.hierarchy.push({ child: bone.name, parent: parentName });
+        }
+        
+        bone.children.forEach(child => {
+            if (child instanceof THREE.Bone) {
+                traverseBones(child, bone.name);
+            }
+        });
+    }
+    
+    if (character.userData.rootBone) {
+        traverseBones(character.userData.rootBone);
+    }
+    
+    const blob = new Blob([JSON.stringify(boneInfo, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = filename;
+    link.click();
+    URL.revokeObjectURL(url);
+    
+    console.log('Bone structure exported! Use this as reference when rigging in Blender/Maya.');
+}
+
+// Load animation from FBX file and map to emote
+function loadEmoteAnimation(character, fbxUrl, emoteName) {
+    if (!character) {
+        console.error('No character provided');
+        return;
+    }
+    
+    const loader = new FBXLoader();
+    loader.load(
+        fbxUrl,
+        (fbx) => {
+            if (fbx.animations && fbx.animations.length > 0) {
+                // Store animation clip
+                const animationClip = fbx.animations[0];
+                animationClip.name = emoteName;
+                emoteAnimations.set(emoteName, animationClip);
+                
+                // Create animation mixer if it doesn't exist
+                if (!animationMixer) {
+                    animationMixer = new THREE.AnimationMixer(character);
+                }
+                
+                console.log(`Animation "${emoteName}" loaded successfully!`);
+                console.log('Animation will be used when performing this emote.');
+                alert(`Animation "${emoteName}" loaded! You can now use it as an emote.`);
+            } else {
+                console.warn('No animations found in FBX file');
+                alert('No animations found in the FBX file. Make sure the file contains animation data.');
+            }
+        },
+        (progress) => {
+            if (progress.lengthComputable) {
+                console.log('Loading progress:', (progress.loaded / progress.total * 100) + '%');
+            }
+        },
+        (error) => {
+            console.error('Failed to load animation:', error);
+            alert('Failed to load FBX animation file. Make sure the file path is correct and the file is accessible.');
+        }
+    );
+}
+
+// Play imported animation for emote
+function playImportedEmoteAnimation(player, emoteName, elapsedTime) {
+    if (!player.userData.skeleton || !emoteAnimations.has(emoteName)) {
+        return false; // No imported animation, use code-based animation
+    }
+    
+    // Use imported animation
+    const animationClip = emoteAnimations.get(emoteName);
+    
+    if (!player.userData.animationMixer) {
+        player.userData.animationMixer = new THREE.AnimationMixer(player);
+    }
+    
+    const mixer = player.userData.animationMixer;
+    const action = mixer.clipAction(animationClip);
+    
+    if (!action.isRunning()) {
+        action.reset();
+        action.play();
+    }
+    
+    // Update mixer
+    const delta = 0.016; // ~60fps
+    mixer.update(delta);
+    
+    // Apply bone rotations to visual model
+    applyBoneRotationsToModel(player);
+    
+    return true; // Animation is playing
+}
+
+// Apply bone rotations to the visual model (sync bones with meshes)
+function applyBoneRotationsToModel(player) {
+    if (!player.userData.bones || !player.userData.skeleton) return;
+    
+    const bones = player.userData.bones;
+    
+    // Map bone rotations to visual model groups
+    // This syncs the bone system with the visual mesh groups
+    
+    // Body
+    if (bones.body && player.userData.body) {
+        player.userData.body.rotation.copy(bones.body.rotation);
+        player.userData.body.position.copy(bones.body.position);
+    }
+    
+    // Head
+    if (bones.head && player.userData.head) {
+        player.userData.head.rotation.copy(bones.head.rotation);
+    }
+    
+    // Left arm chain
+    if (bones.leftShoulder && player.userData.leftArmGroup) {
+        player.userData.leftArmGroup.rotation.copy(bones.leftShoulder.rotation);
+    }
+    if (bones.leftUpperArm && player.userData.leftUpperArm) {
+        player.userData.leftUpperArm.rotation.copy(bones.leftUpperArm.rotation);
+    }
+    if (bones.leftElbow && player.userData.leftForearm) {
+        player.userData.leftForearm.rotation.copy(bones.leftElbow.rotation);
+    }
+    
+    // Right arm chain
+    if (bones.rightShoulder && player.userData.rightArmGroup) {
+        player.userData.rightArmGroup.rotation.copy(bones.rightShoulder.rotation);
+    }
+    if (bones.rightUpperArm && player.userData.rightUpperArm) {
+        player.userData.rightUpperArm.rotation.copy(bones.rightUpperArm.rotation);
+    }
+    if (bones.rightElbow && player.userData.rightForearm) {
+        player.userData.rightForearm.rotation.copy(bones.rightElbow.rotation);
+    }
+    
+    // Left leg chain
+    if (bones.leftHip && player.userData.leftLegGroup) {
+        player.userData.leftLegGroup.rotation.copy(bones.leftHip.rotation);
+    }
+    if (bones.leftThigh && player.userData.leftThigh) {
+        player.userData.leftThigh.rotation.copy(bones.leftThigh.rotation);
+    }
+    if (bones.leftKnee && player.userData.leftShin) {
+        player.userData.leftShin.rotation.copy(bones.leftKnee.rotation);
+    }
+    
+    // Right leg chain
+    if (bones.rightHip && player.userData.rightLegGroup) {
+        player.userData.rightLegGroup.rotation.copy(bones.rightHip.rotation);
+    }
+    if (bones.rightThigh && player.userData.rightThigh) {
+        player.userData.rightThigh.rotation.copy(bones.rightThigh.rotation);
+    }
+    if (bones.rightKnee && player.userData.rightShin) {
+        player.userData.rightShin.rotation.copy(bones.rightKnee.rotation);
+    }
+}
+
+// Export button function (call from console or UI)
+window.exportCharacter = function() {
+    if (localPlayer) {
+        exportCharacterModel(localPlayer, 'character.obj');
+        exportBoneStructure(localPlayer, 'bone_structure.json');
+        console.log('Character exported as OBJ and bone structure as JSON!');
+        console.log('Import OBJ into Blender/Maya, use bone_structure.json as reference for rigging.');
+    } else {
+        alert('No character to export. Please join the game first.');
+    }
+};
+
+// Load animation function (call from console or UI)
+// Usage: loadEmoteAnimation('path/to/animation.fbx', 'gangnam')
+window.loadEmoteAnimation = function(fbxUrl, emoteName) {
+    if (localPlayer) {
+        loadEmoteAnimation(localPlayer, fbxUrl, emoteName);
+    } else {
+        alert('No character to load animation for. Please join the game first.');
+    }
+};
+
+// Helper: Create export button in UI (optional)
+function createExportButton() {
+    const exportBtn = document.createElement('button');
+    exportBtn.textContent = 'Export Model (OBJ + Bones)';
+    exportBtn.title = 'Exports character mesh as OBJ and bone structure as JSON for animation in Blender/Maya';
+    exportBtn.style.cssText = `
+        position: fixed;
+        bottom: 20px;
+        right: 20px;
+        padding: 10px 20px;
+        background: rgba(0, 0, 0, 0.7);
+        color: white;
+        border: 2px solid rgba(255, 255, 255, 0.3);
+        border-radius: 5px;
+        cursor: pointer;
+        z-index: 1000;
+        font-size: 14px;
+    `;
+    exportBtn.addEventListener('click', () => {
+        window.exportCharacter();
+    });
+    document.body.appendChild(exportBtn);
+}
+
+// Initialize export button on game start
+setTimeout(() => {
+    if (document.getElementById('game-container') && document.getElementById('game-container').style.display !== 'none') {
+        createExportButton();
+    }
+}, 2000);
 
 // ==================== CAPE SYSTEM ====================
 // Modular cape configuration - easy to add new capes!
@@ -706,7 +1153,8 @@ function animateCape(cape, player, delta) {
         playerVelocity.y = velocity.y;
         playerVelocity.z = velocity.z;
         moveSpeed = Math.sqrt(velocity.x * velocity.x + velocity.z * velocity.z);
-        isMoving = moveSpeed > 0.01;
+        // Consider player moving if velocity is significant OR if movement keys are pressed
+        isMoving = moveSpeed > 0.01 || moveState.forward || moveState.backward || moveState.left || moveState.right;
         isSprinting = moveState.sprint;
     } else if (player.userData.lastPosition) {
         // Calculate velocity without creating unnecessary Vector3 objects
@@ -786,25 +1234,68 @@ function animateCape(cape, player, delta) {
         }
         
         // When moving forward: cape flows backward (pitch back)
-        // When moving backward: cape doesn't pitch (can't go through body)
-        if (!isMovingBackward && !isStrafing) {
+        // When moving backward: cape also pitches back (but only if NOT in cam lock)
+        if (!isMovingBackward) {
+            // Moving forward: always pitch back
             const flowMultiplier = isSprinting ? 0.4 : 0.25;
             targetRotationX = Math.min(moveSpeed * flowMultiplier, isSprinting ? 0.5 : 0.35);
         } else {
-            targetRotationX = 0;
+            // Moving backward: pitch back only if NOT in cam lock
+            if (player === localPlayer && !cameraLocked) {
+                // Not in cam lock: pitch back when moving backward
+                const flowMultiplier = isSprinting ? 0.4 : 0.25;
+                targetRotationX = Math.min(moveSpeed * flowMultiplier, isSprinting ? 0.5 : 0.35);
+            } else if (player === localPlayer && cameraLocked) {
+                // In cam lock: no pitch back when moving backward (can't go through body)
+                targetRotationX = 0;
+            } else {
+                // For other players: always pitch back when moving backward
+                const flowMultiplier = isSprinting ? 0.4 : 0.25;
+                targetRotationX = Math.min(moveSpeed * flowMultiplier, isSprinting ? 0.5 : 0.35);
+            }
         }
         
-        // Base animation sway (faster when running)
+        // Base animation sway (faster when running) - always applies when moving
         const baseSway = Math.sin(capeData.animationTime * animSpeed) * 0.12;
         
-        // Strafing sway: only apply when actually strafing
+        // Strafing sway: apply when strafing (A or D)
         let strafeSway = 0;
         if (isStrafing) {
             strafeSway = strafeDirection * 0.3;
+            // When strafing, combine with base sway for smoother animation
+            targetRotationZ = strafeSway + baseSway * 0.3;
+        } else {
+            // When not strafing
+            // Check if moving backward (S key)
+            // For local player: check moveState directly
+            // For other players: use isMovingBackward
+            let isPressingS = false;
+            if (player === localPlayer) {
+                isPressingS = moveState.backward && !moveState.forward;
+            } else {
+                isPressingS = isMovingBackward;
+            }
+            
+            if (isPressingS) {
+                // Moving backward (S key)
+                if (player === localPlayer) {
+                    // For local player: check cam lock state
+                    // If NOT in cam lock: apply sway
+                    // If IN cam lock: no sway
+                    if (!cameraLocked) {
+                        targetRotationZ = baseSway;
+                    } else {
+                        targetRotationZ = 0;
+                    }
+                } else {
+                    // For other players: always apply sway when moving backward
+                    targetRotationZ = baseSway;
+                }
+            } else {
+                // When not strafing and not moving backward, use base sway
+                targetRotationZ = baseSway;
+            }
         }
-        
-        // Simplified: use strafe sway when strafing, otherwise base sway
-        targetRotationZ = isStrafing ? strafeSway : baseSway;
     } else {
         // When idle: gentle swaying
         const idleSway = Math.sin(capeData.animationTime * 1.5) * 0.04;
@@ -1269,6 +1760,31 @@ function setupControls() {
                 updateInventoryUI();
                 e.preventDefault();
                 break;
+            case 'KeyB':
+                // Don't process if typing in chat, name input, or sign input
+                if (document.activeElement && (document.activeElement.id === 'chat-input' || document.activeElement.id === 'name-input' || document.activeElement.id === 'sign-input')) {
+                    return;
+                }
+                // Toggle between first-person and third-person view
+                isFirstPerson = !isFirstPerson;
+                if (isFirstPerson) {
+                    // Enable pointer lock automatically when entering first-person view
+                    const canvas = getCanvas();
+                    if (canvas && !pauseMenuOpen) {
+                        canvas.requestPointerLock().catch(() => {
+                            console.log('Pointer lock failed');
+                        });
+                    }
+                } else {
+                    // Disable pointer lock when exiting first-person view
+                    if (document.pointerLockElement) {
+                        document.exitPointerLock();
+                    }
+                    // Reset camera distance to a comfortable third-person distance when exiting first-person
+                    cameraDistance = 8;
+                }
+                e.preventDefault();
+                break;
             case 'ShiftLeft':
             case 'ShiftRight':
                 moveState.sprint = true;
@@ -1296,8 +1812,49 @@ function setupControls() {
                 e.preventDefault();
                 break;
             case 'Escape':
-                // Toggle pause menu
-                togglePauseMenu();
+                // Toggle pause menu (also close emote menu if open)
+                if (emoteMenuOpen) {
+                    closeEmoteMenu();
+                } else {
+                    togglePauseMenu();
+                }
+                e.preventDefault();
+                break;
+            case 'KeyV':
+                // Toggle emote menu
+                if (localPlayer && !currentCar && playerHealth > 0) {
+                    toggleEmoteMenu();
+                }
+                e.preventDefault();
+                break;
+            case 'Digit1':
+            case 'Numpad1':
+                // Select emote 1 (Point) when menu is open
+                if (emoteMenuOpen && localPlayer && !currentCar && playerHealth > 0) {
+                    highlightEmoteItem('point');
+                    performEmote('point');
+                    closeEmoteMenu();
+                }
+                e.preventDefault();
+                break;
+            case 'Digit2':
+            case 'Numpad2':
+                // Select emote 2 (Wave) when menu is open
+                if (emoteMenuOpen && localPlayer && !currentCar && playerHealth > 0) {
+                    highlightEmoteItem('wave');
+                    performEmote('wave');
+                    closeEmoteMenu();
+                }
+                e.preventDefault();
+                break;
+            case 'Digit3':
+            case 'Numpad3':
+                // Select emote 3 (Gangnam Style) when menu is open
+                if (emoteMenuOpen && localPlayer && !currentCar && playerHealth > 0) {
+                    highlightEmoteItem('gangnam');
+                    performEmote('gangnam');
+                    closeEmoteMenu();
+                }
                 e.preventDefault();
                 break;
         }
@@ -1401,7 +1958,12 @@ function setupControls() {
             const deltaX = e.movementX || 0;
             const deltaY = e.movementY || 0;
             cameraAngle -= deltaX * 0.002;
-            cameraPitch += deltaY * 0.002;
+            // Invert vertical axis in first-person view (moving mouse down should look down)
+            if (isFirstPerson) {
+                cameraPitch -= deltaY * 0.002;
+            } else {
+                cameraPitch += deltaY * 0.002;
+            }
             cameraPitch = Math.max(-Math.PI / 3, Math.min(Math.PI / 3, cameraPitch));
         } else if (isMouseDown && e.target.id === 'game-canvas') {
             // Right-click drag camera (when not locked)
@@ -1705,6 +2267,629 @@ function sendChatMessage(message) {
     if (socket) {
         socket.emit('chatMessage', message);
     }
+}
+
+// Setup voice chat
+function setupVoiceChat() {
+    const micButton = document.getElementById('mic-toggle');
+    const micIcon = document.getElementById('mic-icon');
+    const micStatus = document.getElementById('mic-status');
+    
+    if (!micButton || !micIcon || !micStatus) {
+        console.warn('Voice chat UI elements not found');
+        return;
+    }
+    
+    // Initialize Web Audio API context
+    try {
+        audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    } catch (e) {
+        console.error('Web Audio API not supported:', e);
+        return;
+    }
+    
+    // Toggle microphone button click
+    micButton.addEventListener('click', async () => {
+        await toggleMicrophone();
+    });
+    
+    // I key to toggle microphone
+    document.addEventListener('keydown', async (e) => {
+        // Don't toggle if typing in chat, name input, or sign input
+        if (document.activeElement && (document.activeElement.id === 'chat-input' || document.activeElement.id === 'name-input' || document.activeElement.id === 'sign-input')) {
+            return;
+        }
+        
+        if (e.code === 'KeyI' && !pauseMenuOpen) {
+            e.preventDefault();
+            await toggleMicrophone();
+        }
+    });
+    
+    // Update UI state
+    function updateMicUI(isEnabled) {
+        if (isEnabled) {
+            micButton.classList.remove('muted');
+            micButton.classList.add('active');
+            micStatus.textContent = 'Active';
+        } else {
+            micButton.classList.remove('active');
+            micButton.classList.add('muted');
+            micStatus.textContent = 'Muted';
+        }
+    }
+    
+    // Toggle microphone
+    async function toggleMicrophone() {
+        if (!voiceChatEnabled) {
+            // Enable microphone
+            try {
+                // Resume audio context if suspended (required for Web Audio API)
+                if (audioContext) {
+                    console.log('Voice chat: Audio context state before resume:', audioContext.state);
+                    if (audioContext.state === 'suspended') {
+                        await audioContext.resume();
+                        console.log('Voice chat: Audio context resumed, new state:', audioContext.state);
+                    }
+                } else {
+                    console.error('Voice chat: Audio context is null!');
+                }
+                
+                console.log('Voice chat: Requesting microphone access...');
+                localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                console.log('Voice chat: Microphone access granted, stream tracks:', localStream.getTracks().length);
+                voiceChatEnabled = true;
+                updateMicUI(true);
+                
+                // Notify server that we're ready for voice chat
+                if (socket) {
+                    console.log('Voice chat: Emitting voiceChatReady: true');
+                    socket.emit('voiceChatReady', { enabled: true });
+                }
+            } catch (error) {
+                console.error('Error accessing microphone:', error);
+                alert('Failed to access microphone. Please check your permissions.');
+            }
+        } else {
+            // Disable microphone
+            if (localStream) {
+                localStream.getTracks().forEach(track => track.stop());
+                localStream = null;
+            }
+            voiceChatEnabled = false;
+            updateMicUI(false);
+            
+            // Close all peer connections
+            closeAllPeerConnections();
+            
+            // Notify server
+            if (socket) {
+                socket.emit('voiceChatReady', { enabled: false });
+            }
+        }
+    }
+    
+    // Close all peer connections
+    function closeAllPeerConnections() {
+        peerConnections.forEach((pc, playerId) => {
+            pc.close();
+            peerConnections.delete(playerId);
+        });
+        
+        gainNodes.forEach((gain, playerId) => {
+            gain.disconnect();
+            gainNodes.delete(playerId);
+        });
+    }
+    
+    // Create peer connection for a player
+    async function createPeerConnection(playerId) {
+        if (peerConnections.has(playerId)) {
+            console.log('Voice chat: Already have peer connection for', playerId);
+            return; // Already connected
+        }
+        
+        console.log('Voice chat: Creating peer connection for', playerId);
+        
+        const pc = new RTCPeerConnection({
+            iceServers: [
+                { urls: 'stun:stun.l.google.com:19302' },
+                { urls: 'stun:stun1.l.google.com:19302' }
+            ]
+        });
+        
+        // Add local stream tracks
+        if (localStream) {
+            console.log('Voice chat: Adding local stream tracks');
+            localStream.getTracks().forEach(track => {
+                pc.addTrack(track, localStream);
+            });
+        } else {
+            console.error('Voice chat: No localStream when creating peer connection!');
+        }
+        
+        // Handle remote stream
+        pc.ontrack = (event) => {
+            console.log('Voice chat: Received remote stream from', playerId, 'connection state:', pc.connectionState, 'ICE state:', pc.iceConnectionState);
+            const remoteStream = event.streams[0];
+            
+            // Only create if we don't already have a gain node for this player
+            if (!gainNodes.has(playerId)) {
+                console.log('Voice chat: Creating audio nodes for', playerId);
+                
+                // Ensure audio context is running
+                if (audioContext.state === 'suspended') {
+                    console.log('Voice chat: Audio context is suspended, resuming...');
+                    audioContext.resume().then(() => {
+                        console.log('Voice chat: Audio context resumed, state:', audioContext.state);
+                    });
+                }
+                
+                // Create gain node for distance-based volume
+                const source = audioContext.createMediaStreamSource(remoteStream);
+                const gain = audioContext.createGain();
+                // Set initial volume (will be updated by updateVoiceChatVolumes based on distance)
+                gain.gain.value = VOICE_CHAT_MIN_VOLUME * masterVolume;
+                source.connect(gain);
+                gain.connect(audioContext.destination);
+                gainNodes.set(playerId, gain);
+                console.log('Voice chat: Audio nodes created, gain nodes count:', gainNodes.size, 'initial gain:', gain.gain.value, 'audioContext.state:', audioContext.state);
+                
+                // Log stream info for debugging
+                const tracks = remoteStream.getTracks();
+                console.log('Voice chat: Remote stream info:', {
+                    id: remoteStream.id,
+                    active: remoteStream.active,
+                    tracks: tracks.map(t => ({
+                        kind: t.kind,
+                        enabled: t.enabled,
+                        muted: t.muted,
+                        readyState: t.readyState,
+                        label: t.label
+                    }))
+                });
+                
+                // Log current connection states
+                console.log('Voice chat: Connection states when stream received:', {
+                    connectionState: pc.connectionState,
+                    iceConnectionState: pc.iceConnectionState,
+                    iceGatheringState: pc.iceGatheringState,
+                    signalingState: pc.signalingState
+                });
+                
+                // Test if we can actually hear the audio by logging when tracks start
+                tracks.forEach(track => {
+                    track.onended = () => console.log('Voice chat: Track ended for', playerId);
+                    track.onmute = () => console.log('Voice chat: Track muted for', playerId);
+                    track.onunmute = () => console.log('Voice chat: Track unmuted for', playerId);
+                });
+                
+                // Check if we're on localhost - if so, log a warning
+                if (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') {
+                    console.warn('Voice chat: Testing on localhost - if both clients are on the same device, the browser may suppress audio to prevent feedback loops. To properly test voice chat, use two different devices or different browsers.');
+                    console.warn('Voice chat: Connection appears to be working (stream received), but audio may be suppressed by the browser. Try testing with another device or browser.');
+                }
+            }
+        };
+        
+        // Handle ICE candidates
+        pc.onicecandidate = (event) => {
+            if (event.candidate && socket) {
+                socket.emit('voiceChatIceCandidate', {
+                    targetId: playerId,
+                    candidate: event.candidate
+                });
+            }
+        };
+        
+        // Handle connection state
+        pc.onconnectionstatechange = () => {
+            console.log('Voice chat: Connection state changed for', playerId, ':', pc.connectionState);
+            if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
+                console.log('Voice chat: Connection failed/closed, cleaning up', playerId);
+                cleanupPeerConnection(playerId);
+            } else if (pc.connectionState === 'connected') {
+                console.log('Voice chat: Connection established with', playerId);
+            }
+        };
+        
+        // Log ICE connection state
+        pc.oniceconnectionstatechange = () => {
+            console.log('Voice chat: ICE connection state for', playerId, ':', pc.iceConnectionState);
+        };
+        
+        peerConnections.set(playerId, pc);
+        
+        // Create offer
+        try {
+            console.log('Voice chat: Creating offer for', playerId);
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+            console.log('Voice chat: Offer created and set as local description');
+            
+            if (socket) {
+                socket.emit('voiceChatOffer', {
+                    targetId: playerId,
+                    offer: offer
+                });
+                console.log('Voice chat: Offer sent to', playerId);
+            }
+        } catch (error) {
+            console.error('Voice chat: Error creating offer:', error);
+            cleanupPeerConnection(playerId);
+        }
+    }
+    
+    // Handle offer from another player
+    async function handleOffer(playerId, offer) {
+        console.log('Voice chat: Handling offer from', playerId);
+        let pc = peerConnections.get(playerId);
+        
+        // If we already have a peer connection with a local offer, we're in a "glare" situation
+        // In this case, we should close the existing connection and create a new one as the answerer
+        if (pc && pc.signalingState === 'have-local-offer') {
+            console.log('Voice chat: Glare detected - closing existing connection and creating new one as answerer');
+            pc.close();
+            peerConnections.delete(playerId);
+            pendingIceCandidates.delete(playerId);
+            pc = null;
+        }
+        
+        // If we don't have a peer connection, create one
+        if (!pc) {
+            console.log('Voice chat: Creating new peer connection for offer from', playerId);
+            pc = new RTCPeerConnection({
+                iceServers: [
+                    { urls: 'stun:stun.l.google.com:19302' },
+                    { urls: 'stun:stun1.l.google.com:19302' }
+                ]
+            });
+            
+            // Add local stream tracks
+            if (localStream) {
+                localStream.getTracks().forEach(track => {
+                    pc.addTrack(track, localStream);
+                });
+            }
+            
+            // Handle remote stream
+            pc.ontrack = (event) => {
+                console.log('Voice chat: Received remote stream from', playerId);
+                const remoteStream = event.streams[0];
+                
+                // Only create if we don't already have a gain node for this player
+                if (!gainNodes.has(playerId)) {
+                    console.log('Voice chat: Creating audio nodes for', playerId);
+                    
+                    // Ensure audio context is running
+                    if (audioContext.state === 'suspended') {
+                        console.log('Voice chat: Audio context is suspended, resuming...');
+                        audioContext.resume().then(() => {
+                            console.log('Voice chat: Audio context resumed, state:', audioContext.state);
+                        });
+                    }
+                    
+                    // Create gain node for distance-based volume
+                    const source = audioContext.createMediaStreamSource(remoteStream);
+                    const gain = audioContext.createGain();
+                    // Set initial volume (will be updated by updateVoiceChatVolumes based on distance)
+                    gain.gain.value = VOICE_CHAT_MIN_VOLUME * masterVolume;
+                    source.connect(gain);
+                    gain.connect(audioContext.destination);
+                    gainNodes.set(playerId, gain);
+                    console.log('Voice chat: Audio nodes created, gain nodes count:', gainNodes.size, 'initial gain:', gain.gain.value, 'audioContext.state:', audioContext.state);
+                    
+                    // Log stream info for debugging
+                    const tracks = remoteStream.getTracks();
+                    console.log('Voice chat: Remote stream info:', {
+                        id: remoteStream.id,
+                        active: remoteStream.active,
+                        tracks: tracks.map(t => ({
+                            kind: t.kind,
+                            enabled: t.enabled,
+                            muted: t.muted,
+                            readyState: t.readyState,
+                            label: t.label
+                        }))
+                    });
+                    
+                    // Test if we can actually hear the audio by logging when tracks start
+                    tracks.forEach(track => {
+                        track.onended = () => console.log('Voice chat: Track ended for', playerId);
+                        track.onmute = () => console.log('Voice chat: Track muted for', playerId);
+                        track.onunmute = () => console.log('Voice chat: Track unmuted for', playerId);
+                    });
+                    
+                    // Check if we're on localhost - if so, log a warning
+                    if (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') {
+                        console.warn('Voice chat: Testing on localhost - if both clients are on the same device, you may hear echo/feedback. If you hear nothing, the browser may be suppressing audio.');
+                    }
+                }
+            };
+            
+            // Handle ICE candidates
+            pc.onicecandidate = (event) => {
+                if (event.candidate && socket) {
+                    socket.emit('voiceChatIceCandidate', {
+                        targetId: playerId,
+                        candidate: event.candidate
+                    });
+                }
+            };
+            
+            // Handle connection state
+            pc.onconnectionstatechange = () => {
+                console.log('Voice chat: Connection state changed (handleOffer) for', playerId, ':', pc.connectionState);
+                if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
+                    console.log('Voice chat: Connection failed/closed (handleOffer), cleaning up', playerId);
+                    cleanupPeerConnection(playerId);
+                } else if (pc.connectionState === 'connected') {
+                    console.log('Voice chat: Connection established (handleOffer) with', playerId);
+                }
+            };
+            
+            // Log ICE connection state
+            pc.oniceconnectionstatechange = () => {
+                console.log('Voice chat: ICE connection state (handleOffer) for', playerId, ':', pc.iceConnectionState);
+            };
+            
+            peerConnections.set(playerId, pc);
+        } else {
+            console.log('Voice chat: Using existing peer connection for offer from', playerId, 'signaling state:', pc.signalingState, 'connection state:', pc.connectionState);
+            
+            // If the connection is already stable, we can't set another remote description
+            if (pc.signalingState === 'stable') {
+                console.log('Voice chat: Connection already stable, ignoring duplicate offer');
+                return;
+            }
+            
+            // If we're already processing an offer (have-remote-offer), ignore duplicate
+            if (pc.signalingState === 'have-remote-offer') {
+                console.log('Voice chat: Already processing an offer (have-remote-offer), ignoring duplicate');
+                return;
+            }
+            
+            // If connection is closed/failed, create a new one
+            if (pc.connectionState === 'closed' || pc.connectionState === 'failed') {
+                console.log('Voice chat: Existing connection is closed/failed, will recreate on next nearby players update');
+                return;
+            }
+        }
+        
+        try {
+            console.log('Voice chat: Setting remote description (offer) from', playerId, 'signaling state before:', pc.signalingState);
+            await pc.setRemoteDescription(new RTCSessionDescription(offer));
+            console.log('Voice chat: Remote description set, creating answer');
+            
+            // Process any pending ICE candidates
+            const pending = pendingIceCandidates.get(playerId);
+            if (pending && pending.length > 0) {
+                console.log('Voice chat: Processing', pending.length, 'pending ICE candidates for', playerId);
+                for (const candidate of pending) {
+                    try {
+                        await pc.addIceCandidate(new RTCIceCandidate(candidate));
+                    } catch (err) {
+                        console.error('Voice chat: Error adding pending ICE candidate:', err);
+                    }
+                }
+                pendingIceCandidates.delete(playerId);
+            }
+            
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+            console.log('Voice chat: Answer created and set as local description');
+            
+            if (socket) {
+                socket.emit('voiceChatAnswer', {
+                    targetId: playerId,
+                    answer: answer
+                });
+                console.log('Voice chat: Answer sent to', playerId);
+            }
+        } catch (error) {
+            console.error('Voice chat: Error handling offer:', error);
+            cleanupPeerConnection(playerId);
+        }
+    }
+    
+    // Handle answer from another player
+    async function handleAnswer(playerId, answer) {
+        console.log('Voice chat: Handling answer from', playerId);
+        const pc = peerConnections.get(playerId);
+        if (pc) {
+            // Check if connection is already stable (offer/answer exchange already completed)
+            if (pc.signalingState === 'stable') {
+                console.log('Voice chat: Connection already stable, ignoring duplicate answer');
+                return;
+            }
+            
+            // Check if we're in the right state to receive an answer (should be "have-local-offer")
+            if (pc.signalingState !== 'have-local-offer') {
+                console.log('Voice chat: Connection not in "have-local-offer" state, ignoring answer. Current state:', pc.signalingState);
+                return;
+            }
+            
+            try {
+                console.log('Voice chat: Setting remote description (answer) from', playerId, 'current signaling state:', pc.signalingState);
+                await pc.setRemoteDescription(new RTCSessionDescription(answer));
+                console.log('Voice chat: Remote description set successfully, new signaling state:', pc.signalingState);
+                
+                // Process any pending ICE candidates
+                const pending = pendingIceCandidates.get(playerId);
+                if (pending && pending.length > 0) {
+                    console.log('Voice chat: Processing', pending.length, 'pending ICE candidates for', playerId);
+                    for (const candidate of pending) {
+                        try {
+                            await pc.addIceCandidate(new RTCIceCandidate(candidate));
+                        } catch (err) {
+                            console.error('Voice chat: Error adding pending ICE candidate:', err);
+                        }
+                    }
+                    pendingIceCandidates.delete(playerId);
+                }
+            } catch (error) {
+                console.error('Voice chat: Error handling answer:', error);
+                // Don't cleanup on error - might be a duplicate answer
+                console.log('Voice chat: Answer error details - signaling state:', pc.signalingState, 'connection state:', pc.connectionState);
+            }
+        } else {
+            console.error('Voice chat: No peer connection found for', playerId, 'when handling answer');
+        }
+    }
+    
+    // Handle ICE candidate from another player
+    async function handleIceCandidate(playerId, candidate) {
+        const pc = peerConnections.get(playerId);
+        if (pc) {
+            // Check if remote description is set
+            if (pc.remoteDescription) {
+                try {
+                    await pc.addIceCandidate(new RTCIceCandidate(candidate));
+                    console.log('Voice chat: ICE candidate added for', playerId);
+                } catch (error) {
+                    console.error('Voice chat: Error handling ICE candidate:', error);
+                }
+            } else {
+                // Queue the ICE candidate until remote description is set
+                console.log('Voice chat: Queueing ICE candidate for', playerId, '(remote description not set yet)');
+                if (!pendingIceCandidates.has(playerId)) {
+                    pendingIceCandidates.set(playerId, []);
+                }
+                pendingIceCandidates.get(playerId).push(candidate);
+            }
+        } else {
+            console.warn('Voice chat: No peer connection found for', playerId, 'when handling ICE candidate');
+        }
+    }
+    
+    // Cleanup peer connection
+    function cleanupPeerConnection(playerId) {
+        const pc = peerConnections.get(playerId);
+        if (pc) {
+            pc.close();
+            peerConnections.delete(playerId);
+        }
+        
+        const gain = gainNodes.get(playerId);
+        if (gain) {
+            gain.disconnect();
+            gainNodes.delete(playerId);
+        }
+        
+        // Clear pending ICE candidates
+        pendingIceCandidates.delete(playerId);
+    }
+    
+    // Update audio volumes based on distance (called from animate loop)
+    window.updateVoiceChatVolumes = function() {
+        if (!localPlayer || !camera || !localPlayer.position) return;
+        
+        gainNodes.forEach((gain, playerId) => {
+            const otherPlayer = otherPlayers.get(playerId);
+            if (!otherPlayer || !otherPlayer.position) {
+                // Player left or position not available, cleanup will happen elsewhere
+                return;
+            }
+            
+            // Calculate distance between local player and other player
+            const dx = localPlayer.position.x - otherPlayer.position.x;
+            const dy = localPlayer.position.y - otherPlayer.position.y;
+            const dz = localPlayer.position.z - otherPlayer.position.z;
+            const distance = Math.sqrt(dx * dx + dy * dy + dz * dz);
+            
+            // Calculate volume based on distance with smooth falloff
+            // Volume decreases linearly from max at distance 0 to min at max distance
+            let volumeRatio;
+            if (distance >= VOICE_CHAT_DISTANCE) {
+                // Beyond max distance - completely silent
+                volumeRatio = 0;
+            } else {
+                // Linear interpolation: volume goes from 1.0 at distance 0 to 0.0 at distance VOICE_CHAT_DISTANCE
+                // This creates a smooth fade from full volume to silence
+                volumeRatio = 1 - (distance / VOICE_CHAT_DISTANCE);
+                // Clamp between 0 and 1 to ensure valid volume range
+                volumeRatio = Math.max(0, Math.min(1, volumeRatio));
+            }
+            
+            // Apply master volume and distance-based volume
+            // volumeRatio is already 0-1, so multiply by max volume and master volume
+            const targetVolume = volumeRatio * VOICE_CHAT_MAX_VOLUME * masterVolume;
+            
+            // Smoothly interpolate to target volume to avoid abrupt changes
+            const currentVolume = gain.gain.value;
+            const volumeDiff = targetVolume - currentVolume;
+            if (Math.abs(volumeDiff) > 0.01) { // Only update if difference is significant
+                // Smooth interpolation (lerp) for gradual volume changes
+                gain.gain.value = currentVolume + volumeDiff * 0.1; // Adjust 10% towards target per frame
+            } else {
+                gain.gain.value = targetVolume; // Close enough, set directly
+            }
+        });
+    };
+    
+    // Socket event handlers for voice chat (will be set up in connectToServer)
+    window.voiceChatSetupSocketHandlers = function() {
+        console.log('Voice chat: Setting up socket handlers');
+        if (!socket) {
+            console.error('Voice chat: No socket available!');
+            return;
+        }
+        
+        socket.on('voiceChatOffer', (data) => {
+            console.log('Voice chat: Received offer from', data.fromId);
+            if (voiceChatEnabled && localStream) {
+                handleOffer(data.fromId, data.offer);
+            } else {
+                console.log('Voice chat: Ignoring offer - enabled:', voiceChatEnabled, 'stream:', !!localStream);
+            }
+        });
+        
+        socket.on('voiceChatAnswer', (data) => {
+            console.log('Voice chat: Received answer from', data.fromId);
+            handleAnswer(data.fromId, data.answer);
+        });
+        
+        socket.on('voiceChatIceCandidate', (data) => {
+            console.log('Voice chat: Received ICE candidate from', data.fromId);
+            handleIceCandidate(data.fromId, data.candidate);
+        });
+        
+        socket.on('voiceChatPlayersNearby', (data) => {
+            console.log('Voice chat: Received nearby players', data.nearbyPlayers);
+            if (!voiceChatEnabled || !localStream) {
+                console.log('Voice chat: Skipping - enabled:', voiceChatEnabled, 'stream:', !!localStream);
+                return;
+            }
+            
+            const nearbyPlayers = new Set(data.nearbyPlayers || []);
+            console.log('Voice chat: Nearby players set:', Array.from(nearbyPlayers));
+            
+            // Create connections for new nearby players
+            nearbyPlayers.forEach(playerId => {
+                const existingPc = peerConnections.get(playerId);
+                if (!existingPc) {
+                    console.log('Voice chat: Creating connection for new player', playerId);
+                    createPeerConnection(playerId);
+                } else {
+                    // Check if existing connection is actually still valid
+                    if (existingPc.connectionState === 'closed' || existingPc.connectionState === 'failed') {
+                        console.log('Voice chat: Existing connection to', playerId, 'is closed/failed, cleaning up and recreating');
+                        cleanupPeerConnection(playerId);
+                        createPeerConnection(playerId);
+                    }
+                    // If connection is stable or in progress, leave it alone
+                }
+            });
+            
+            // Clean up connections for players who are no longer nearby
+            peerConnections.forEach((pc, playerId) => {
+                if (!nearbyPlayers.has(playerId)) {
+                    console.log('Voice chat: Cleaning up connection for', playerId);
+                    cleanupPeerConnection(playerId);
+                }
+            });
+        });
+    };
 }
 
 // Show help window
@@ -2609,6 +3794,12 @@ function animateStickman(player, delta) {
         return;
     }
     
+    // Check if player is performing an emote - emotes take priority
+    if (player.userData.currentEmote) {
+        updateEmoteAnimation(player, delta);
+        return;
+    }
+    
     // Check if player is jumping or falling - jump animation takes priority
     const isJumpingOrFalling = player.userData.isJumping || (player === localPlayer && !canJump && velocity.y !== 0);
     
@@ -2813,6 +4004,332 @@ function animateStickman(player, delta) {
     }
 }
 
+// ==================== EMOTE SYSTEM ====================
+
+// Easing functions for smooth animations
+function easeInOutCubic(t) {
+    return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+}
+
+function easeOutElastic(t) {
+    const c4 = (2 * Math.PI) / 3;
+    return t === 0 ? 0 : t === 1 ? 1 : Math.pow(2, -10 * t) * Math.sin((t * 10 - 0.75) * c4) + 1;
+}
+
+function easeInOutQuad(t) {
+    return t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
+}
+
+// Smooth interpolation helper - applies lerp to reach target value
+function smoothRotate(current, targetValue, speed = 0.15) {
+    return THREE.MathUtils.lerp(current, targetValue, speed);
+}
+
+// Animate pointing gesture - Natural pointing with proper arm extension
+function animatePointGesture(player, elapsedTime) {
+    if (!player.userData.rightArmGroup || !player.userData.rightForearm || 
+        !player.userData.leftArmGroup) return;
+    
+    const duration = EMOTE_DURATIONS.point;
+    const progress = Math.min(elapsedTime / duration, 1.0);
+    
+    if (progress < 1.0) {
+        // Phase 1 (0-0.3s): Anticipation - slight pull back
+        // Phase 2 (0.3-0.7s): Point - extend arm forward
+        // Phase 3 (0.7-2.0s): Hold - maintain pointing position
+        
+        let armX, armZ, forearmX;
+        
+        if (progress < 0.15) {
+            // Anticipation: slight pull back
+            const anticipation = progress / 0.15;
+            const eased = easeInOutQuad(anticipation);
+            armX = -0.2 * eased; // Slight backward
+            armZ = 0.05;
+            forearmX = 0.3 * eased; // Slight bend back
+        } else if (progress < 0.4) {
+            // Point: extend forward
+            const pointProgress = (progress - 0.15) / 0.25;
+            const eased = easeOutElastic(pointProgress);
+            armX = -0.2 + (-1.1 * eased); // Extend forward
+            armZ = 0.05 + (0.1 * eased); // Slight outward
+            forearmX = 0.3 + (-0.5 * eased); // Straighten for pointing
+        } else {
+            // Hold: maintain pointing position
+            armX = -1.3; // Fully extended forward
+            armZ = 0.15; // Slight outward angle
+            forearmX = -0.2; // Nearly straight (pointing)
+        }
+        
+        // Apply rotations smoothly
+        player.userData.rightArmGroup.rotation.x = smoothRotate(
+            player.userData.rightArmGroup.rotation.x,
+            armX,
+            0.25
+        );
+        player.userData.rightArmGroup.rotation.z = smoothRotate(
+            player.userData.rightArmGroup.rotation.z,
+            armZ,
+            0.25
+        );
+        player.userData.rightForearm.rotation.x = smoothRotate(
+            player.userData.rightForearm.rotation.x,
+            forearmX,
+            0.25
+        );
+        
+        // Left arm stays relaxed at side
+        player.userData.leftArmGroup.rotation.x = smoothRotate(
+            player.userData.leftArmGroup.rotation.x,
+            0,
+            0.15
+        );
+        player.userData.leftArmGroup.rotation.z = smoothRotate(
+            player.userData.leftArmGroup.rotation.z,
+            0,
+            0.15
+        );
+    }
+}
+
+// Animate waving gesture - Natural friendly wave
+function animateWaveGesture(player, elapsedTime) {
+    if (!player.userData.rightArmGroup || !player.userData.rightForearm ||
+        !player.userData.leftArmGroup) return;
+    
+    const duration = EMOTE_DURATIONS.wave;
+    const progress = Math.min(elapsedTime / duration, 1.0);
+    
+    if (progress < 1.0) {
+        // Phase 1 (0-0.2s): Raise arm up
+        // Phase 2 (0.2-2.3s): Wave side to side
+        // Phase 3 (2.3-2.5s): Lower arm
+        
+        let armX, armZ, forearmX;
+        const waveSpeed = 6.0; // Waves per second
+        
+        if (progress < 0.08) {
+            // Raise arm up smoothly
+            const raiseProgress = progress / 0.08;
+            const eased = easeInOutCubic(raiseProgress);
+            armX = -0.9 * eased; // Raise up
+            armZ = 0.6 * eased; // Out to side
+            forearmX = -0.5 * eased; // Bend elbow
+        } else if (progress < 0.92) {
+            // Wave side to side
+            const waveTime = (progress - 0.08) * duration;
+            const wavePhase = Math.sin(waveTime * waveSpeed * Math.PI * 2);
+            const waveAmount = wavePhase * 0.6; // Side to side motion
+            
+            armX = -0.9; // Keep arm raised
+            armZ = 0.6 + waveAmount; // Wave side to side
+            forearmX = -0.5 + Math.abs(wavePhase) * 0.2; // Slight bend variation
+        } else {
+            // Lower arm down
+            const lowerProgress = (progress - 0.92) / 0.08;
+            const eased = easeInOutCubic(lowerProgress);
+            armX = -0.9 + (0.9 * eased); // Lower down
+            armZ = 0.6 - (0.6 * eased); // Return to side
+            forearmX = -0.5 + (0.5 * eased); // Straighten
+        }
+        
+        // Apply rotations smoothly
+        player.userData.rightArmGroup.rotation.x = smoothRotate(
+            player.userData.rightArmGroup.rotation.x,
+            armX,
+            0.3
+        );
+        player.userData.rightArmGroup.rotation.z = smoothRotate(
+            player.userData.rightArmGroup.rotation.z,
+            armZ,
+            0.4
+        );
+        player.userData.rightForearm.rotation.x = smoothRotate(
+            player.userData.rightForearm.rotation.x,
+            forearmX,
+            0.3
+        );
+        
+        // Left arm stays relaxed
+        player.userData.leftArmGroup.rotation.x = smoothRotate(
+            player.userData.leftArmGroup.rotation.x,
+            0,
+            0.15
+        );
+        player.userData.leftArmGroup.rotation.z = smoothRotate(
+            player.userData.leftArmGroup.rotation.z,
+            0,
+            0.15
+        );
+    }
+}
+
+// Animate Gangnam Style dance - Based on actual Psy choreography
+// Key moves: Arms cross in front, lasso motion, side steps with leg crosses
+function animateGangnamStyle(player, elapsedTime) {
+    if (!player.userData.leftArmGroup || !player.userData.rightArmGroup ||
+        !player.userData.leftLegGroup || !player.userData.rightLegGroup ||
+        !player.userData.body || !player.userData.leftForearm || !player.userData.rightForearm ||
+        !player.userData.leftThigh || !player.userData.rightThigh ||
+        !player.userData.leftShin || !player.userData.rightShin ||
+        !player.userData.head) return;
+    
+    const duration = EMOTE_DURATIONS.gangnam;
+    const loopedTime = elapsedTime % duration;
+    
+    // Dance tempo: 132 BPM
+    const bpm = 132;
+    const beatsPerSecond = bpm / 60; // 2.2 beats/sec
+    // Main pattern is 8 beats (4 measures)
+    const patternDuration = 8 / beatsPerSecond; // ~3.636 seconds
+    const patternPhase = (loopedTime % patternDuration) / patternDuration; // 0 to 1
+    
+    // Break down into 8 beats (0-1, 1-2, 2-3, etc.)
+    const beat = Math.floor(patternPhase * 8);
+    const beatProgress = (patternPhase * 8) % 1; // Progress within current beat
+    
+    // === ARMS: The actual dance pattern ===
+    // Beats 0-2: Arms cross in front (hands near opposite shoulders)
+    // Beats 2-4: Arms swing out to sides (lasso motion)
+    // Beats 4-6: Arms cross again
+    // Beats 6-8: Arms swing out again
+    
+    let leftArmX, leftArmZ, leftForearmX;
+    let rightArmX, rightArmZ, rightForearmX;
+    
+    if (beat < 2 || (beat >= 4 && beat < 6)) {
+        // Phase 1: Arms cross in front (beats 0-2 and 4-6)
+        const crossProgress = beatProgress;
+        const eased = easeInOutCubic(crossProgress);
+        
+        // Left arm: crosses to right, hand near right shoulder
+        leftArmX = -0.5 - eased * 0.1; // Up and forward
+        leftArmZ = 0.6 + eased * 0.5; // Cross over to right
+        leftForearmX = -0.6 - eased * 0.1; // Bend elbow
+        
+        // Right arm: crosses to left, hand near left shoulder
+        rightArmX = -0.5 - eased * 0.1; // Up and forward
+        rightArmZ = -0.6 - eased * 0.5; // Cross over to left
+        rightForearmX = -0.6 - eased * 0.1; // Bend elbow
+    } else {
+        // Phase 2: Arms swing out in lasso motion (beats 2-4 and 6-8)
+        const lassoProgress = beatProgress;
+        const eased = easeInOutCubic(lassoProgress);
+        
+        // Lasso: circular motion out and up
+        const lassoAngle = eased * Math.PI * 0.8; // 0 to ~2.5 radians
+        
+        // Left arm: swings out to left in lasso
+        leftArmX = -0.8 - Math.sin(lassoAngle) * 0.2; // Up and out
+        leftArmZ = -0.4 - Math.cos(lassoAngle) * 0.5; // Circular to left
+        leftForearmX = -0.4 + Math.sin(lassoAngle) * 0.15; // Vary elbow
+        
+        // Right arm: swings out to right in lasso
+        rightArmX = -0.8 - Math.sin(lassoAngle) * 0.2; // Up and out
+        rightArmZ = 0.4 + Math.cos(lassoAngle) * 0.5; // Circular to right
+        rightForearmX = -0.4 + Math.sin(lassoAngle) * 0.15; // Vary elbow
+    }
+    
+    // Apply arm rotations
+    player.userData.leftArmGroup.rotation.x = smoothRotate(player.userData.leftArmGroup.rotation.x, leftArmX, 0.2);
+    player.userData.leftArmGroup.rotation.z = smoothRotate(player.userData.leftArmGroup.rotation.z, leftArmZ, 0.2);
+    player.userData.leftForearm.rotation.x = smoothRotate(player.userData.leftForearm.rotation.x, leftForearmX, 0.2);
+    
+    player.userData.rightArmGroup.rotation.x = smoothRotate(player.userData.rightArmGroup.rotation.x, rightArmX, 0.2);
+    player.userData.rightArmGroup.rotation.z = smoothRotate(player.userData.rightArmGroup.rotation.z, rightArmZ, 0.2);
+    player.userData.rightForearm.rotation.x = smoothRotate(player.userData.rightForearm.rotation.x, rightForearmX, 0.2);
+    
+    // === LEGS: Side steps with crosses ===
+    // Pattern: Step to side, cross leg, step to other side, cross leg
+    // This creates the signature side-stepping motion
+    
+    const legCycle = patternPhase * 2; // 0 to 2 (two full cycles per 8-beat pattern)
+    const legPhase = Math.sin(legCycle * Math.PI); // -1 to 1
+    
+    // Legs move side to side (not forward/back like galloping)
+    // Left leg: steps left when positive, right when negative
+    const leftLegSide = legPhase * 0.4; // Side movement
+    player.userData.leftLegGroup.rotation.z = leftLegSide; // Rotate to side
+    player.userData.leftLegGroup.rotation.x = Math.abs(legPhase) * 0.3; // Lift slightly when stepping
+    
+    // Right leg: opposite side
+    const rightLegSide = -legPhase * 0.4;
+    player.userData.rightLegGroup.rotation.z = rightLegSide;
+    player.userData.rightLegGroup.rotation.x = Math.abs(legPhase) * 0.3;
+    
+    // Knees bend when stepping
+    player.userData.leftShin.rotation.x = Math.abs(legPhase) * 0.4;
+    player.userData.rightShin.rotation.x = Math.abs(legPhase) * 0.4;
+    
+    // === BODY: Upright with bounce ===
+    // Body stays upright (not leaning forward like horse riding)
+    const bodyBounce = Math.sin(patternPhase * Math.PI * 4) * 0.04; // Bounce with rhythm
+    player.userData.body.position.y = 0.65 + bodyBounce;
+    
+    // Body stays mostly upright, slight side-to-side with steps
+    player.userData.body.rotation.x = 0; // No forward lean
+    player.userData.body.rotation.z = legPhase * 0.05; // Slight sway with steps
+    
+    // === HEAD: Moves with body ===
+    const headBob = Math.sin(patternPhase * Math.PI * 4) * 0.02;
+    player.userData.head.position.y = 0.78 + headBob;
+    player.userData.head.rotation.z = legPhase * 0.04; // Slight tilt with steps
+}
+
+// Update emote animation for a player
+function updateEmoteAnimation(player, delta) {
+    if (!player.userData.currentEmote || !player.userData.emoteStartTime) return;
+    
+    const elapsedTime = (performance.now() - player.userData.emoteStartTime) / 1000;
+    const emoteType = player.userData.currentEmote;
+    
+    // Check if emote should end (except Gangnam which loops)
+    if (emoteType !== 'gangnam' && elapsedTime >= EMOTE_DURATIONS[emoteType]) {
+        // End emote
+        player.userData.currentEmote = null;
+        player.userData.emoteStartTime = null;
+        // Stop animation mixer if using imported animation
+        if (player.userData.animationMixer) {
+            player.userData.animationMixer.stopAllAction();
+        }
+        return;
+    }
+    
+    // Try to use imported animation first, fall back to code-based animation
+    if (playImportedEmoteAnimation(player, emoteType, elapsedTime)) {
+        // Imported animation is playing
+        return;
+    }
+    
+    // Fall back to code-based animations
+    switch (emoteType) {
+        case 'point':
+            animatePointGesture(player, elapsedTime);
+            break;
+        case 'wave':
+            animateWaveGesture(player, elapsedTime);
+            break;
+        case 'gangnam':
+            animateGangnamStyle(player, elapsedTime);
+            break;
+    }
+}
+
+// Start an emote for a player
+function startEmote(player, emoteType) {
+    if (!player || !EMOTE_DURATIONS[emoteType]) return;
+    
+    player.userData.currentEmote = emoteType;
+    player.userData.emoteStartTime = performance.now();
+}
+
+// Stop an emote for a player
+function stopEmote(player) {
+    if (!player) return;
+    player.userData.currentEmote = null;
+    player.userData.emoteStartTime = null;
+}
+
 // Setup building menu
 function setupBuildingMenu() {
     const blockSelectors = document.querySelectorAll('.block-selector');
@@ -2825,6 +4342,98 @@ function setupBuildingMenu() {
     });
 }
 
+// Setup emote menu
+function setupEmoteMenu() {
+    const emoteMenu = document.getElementById('emote-menu');
+    if (!emoteMenu) return;
+    
+    const emoteItems = emoteMenu.querySelectorAll('.emote-item');
+    emoteItems.forEach(item => {
+        item.addEventListener('click', () => {
+            const emoteType = item.dataset.emote;
+            if (emoteType) {
+                performEmote(emoteType);
+                closeEmoteMenu();
+            }
+        });
+    });
+    
+    // Close menu when clicking outside
+    emoteMenu.addEventListener('click', (e) => {
+        if (e.target === emoteMenu) {
+            closeEmoteMenu();
+        }
+    });
+}
+
+// Highlight emote item briefly
+function highlightEmoteItem(emoteType) {
+    const emoteMenu = document.getElementById('emote-menu');
+    if (!emoteMenu) return;
+    
+    const item = emoteMenu.querySelector(`[data-emote="${emoteType}"]`);
+    if (item) {
+        item.classList.add('selected');
+        setTimeout(() => {
+            item.classList.remove('selected');
+        }, 200);
+    }
+}
+
+// Open emote menu
+function openEmoteMenu() {
+    const emoteMenu = document.getElementById('emote-menu');
+    if (emoteMenu) {
+        emoteMenu.style.display = 'block';
+        emoteMenuOpen = true;
+    }
+}
+
+// Close emote menu
+function closeEmoteMenu() {
+    const emoteMenu = document.getElementById('emote-menu');
+    if (emoteMenu) {
+        emoteMenu.style.display = 'none';
+        emoteMenuOpen = false;
+        // Remove selected state from all items
+        const emoteItems = emoteMenu.querySelectorAll('.emote-item');
+        emoteItems.forEach(item => item.classList.remove('selected'));
+    }
+}
+
+// Toggle emote menu
+function toggleEmoteMenu() {
+    if (emoteMenuOpen) {
+        closeEmoteMenu();
+    } else {
+        openEmoteMenu();
+    }
+}
+
+// Perform emote
+function performEmote(emoteType) {
+    if (!localPlayer || currentCar || playerHealth <= 0) return;
+    
+    // If Gangnam Style is already active, stop it
+    if (emoteType === 'gangnam' && currentEmote === 'gangnam') {
+        stopEmote(localPlayer);
+        currentEmote = null;
+        emoteStartTime = 0;
+        if (socket) {
+            socket.emit('playerEmote', { emote: null });
+        }
+        return;
+    }
+    
+    // Start the emote
+    startEmote(localPlayer, emoteType);
+    currentEmote = emoteType;
+    emoteStartTime = performance.now();
+    if (socket) {
+        socket.emit('playerEmote', { emote: emoteType });
+    }
+}
+
 // Update build mode UI
 function updateBuildModeUI() {
     const instructions = document.getElementById('instructions');
@@ -2833,17 +4442,20 @@ function updateBuildModeUI() {
             instructions.innerHTML = `
                 <p><strong>WASD</strong> - Move | <strong>Shift</strong> - Sprint | <strong>Space</strong> - Jump | <strong>Right Click + Drag</strong> - Look around</p>
                 <p><strong>Q</strong> - Cycle Mode | <strong>R</strong> - Block Inventory | <strong>F</strong> - Item Inventory | <strong>Left Click</strong> - Place block | <strong>Mode: BUILD</strong></p>
+                <p><strong>V</strong> - Emotes | <strong>1/2/3</strong> - Select emote when menu is open</p>
             `;
         } else if (buildMode === 'delete') {
             instructions.innerHTML = `
                 <p><strong>WASD</strong> - Move | <strong>Shift</strong> - Sprint | <strong>Space</strong> - Jump | <strong>Right Click + Drag</strong> - Look around</p>
                 <p><strong>Q</strong> - Cycle Mode | <strong>R</strong> - Block Inventory | <strong>F</strong> - Item Inventory | <strong>Left Click</strong> - Delete block | <strong>Mode: DELETE</strong></p>
+                <p><strong>V</strong> - Emotes | <strong>1/2/3</strong> - Select emote when menu is open</p>
             `;
         } else {
             const itemName = localPlayer && localPlayer.userData.equippedItem ? localPlayer.userData.equippedItem : 'None';
             instructions.innerHTML = `
                 <p><strong>WASD</strong> - Move | <strong>Shift</strong> - Sprint | <strong>Space</strong> - Jump | <strong>Right Click + Drag</strong> - Look around</p>
                 <p><strong>Q</strong> - Cycle Mode | <strong>R</strong> - Block Inventory | <strong>F</strong> - Item Inventory | <strong>Left Click</strong> - Use ${itemName} | <strong>Mode: ITEM</strong></p>
+                <p><strong>V</strong> - Emotes | <strong>1/2/3</strong> - Select emote when menu is open</p>
             `;
         }
     }
@@ -4940,7 +6552,37 @@ function returnToMenu() {
     
     // Remove other players and their UI elements
     otherPlayers.forEach((player) => {
-        scene.remove(player);
+        // Remove cape if it exists
+        if (player.userData.capeMesh) {
+            const capeMesh = player.userData.capeMesh;
+            if (capeMesh.parent) {
+                scene.remove(capeMesh);
+            }
+            // Dispose cape geometry and materials
+            capeMesh.traverse((child) => {
+                if (child instanceof THREE.Mesh) {
+                    if (child.geometry) child.geometry.dispose();
+                    if (child.material) {
+                        if (Array.isArray(child.material)) {
+                            child.material.forEach(m => m.dispose());
+                        } else {
+                            child.material.dispose();
+                        }
+                    }
+                }
+            });
+        }
+        
+        // Remove from scene
+        if (player.parent) {
+            scene.remove(player);
+        }
+        const index = scene.children.indexOf(player);
+        if (index !== -1) {
+            scene.children.splice(index, 1);
+        }
+        
+        // Remove UI elements
         if (player.userData.speechBubble && player.userData.speechBubble.parentNode) {
             player.userData.speechBubble.parentNode.removeChild(player.userData.speechBubble);
         }
@@ -4953,6 +6595,20 @@ function returnToMenu() {
         if (player.userData.typingBubble && player.userData.typingBubble.parentNode) {
             player.userData.typingBubble.parentNode.removeChild(player.userData.typingBubble);
         }
+        
+        // Dispose player geometry and materials
+        player.traverse((child) => {
+            if (child instanceof THREE.Mesh) {
+                if (child.geometry) child.geometry.dispose();
+                if (child.material) {
+                    if (Array.isArray(child.material)) {
+                        child.material.forEach(m => m.dispose());
+                    } else {
+                        child.material.dispose();
+                    }
+                }
+            }
+        });
     });
     otherPlayers.clear();
     
@@ -5006,6 +6662,21 @@ function returnToMenu() {
 function killPlayer() {
     if (!localPlayer || !socket) return;
     
+    // Close emote menu if open
+    if (emoteMenuOpen) {
+        closeEmoteMenu();
+    }
+    
+    // Stop any active emote
+    if (currentEmote) {
+        stopEmote(localPlayer);
+        currentEmote = null;
+        emoteStartTime = 0;
+        if (socket) {
+            socket.emit('playerEmote', { emote: null });
+        }
+    }
+    
     // Set health to 0 and notify server
     playerHealth = 0;
     if (socket) {
@@ -5054,6 +6725,10 @@ function connectToServer() {
         socket.off('carUpdated');
         socket.off('playerEnteredCar');
         socket.off('playerExitedCar');
+        socket.off('voiceChatOffer');
+        socket.off('voiceChatAnswer');
+        socket.off('voiceChatIceCandidate');
+        socket.off('voiceChatPlayersNearby');
     }
 
     socket.on('connect', () => {
@@ -5127,9 +6802,26 @@ function connectToServer() {
             // Head no longer rotates with camera - keep it fixed
             // Check if player is moving
             const distance = oldPos.distanceTo(player.position);
+            const wasMoving = player.userData.isMoving;
             player.userData.isMoving = distance > 0.01;
             // Sync sprint state for animation
             player.userData.isSprinting = data.isSprinting || false;
+            
+            // Stop non-looping emotes when player starts moving
+            if (player.userData.isMoving && !wasMoving && player.userData.currentEmote && player.userData.currentEmote !== 'gangnam') {
+                stopEmote(player);
+            }
+        }
+    });
+    
+    socket.on('playerEmote', (data) => {
+        const player = otherPlayers.get(data.id);
+        if (player) {
+            if (data.emote) {
+                startEmote(player, data.emote);
+            } else {
+                stopEmote(player);
+            }
         }
     });
     
@@ -5219,6 +6911,12 @@ function connectToServer() {
                 }
                 player.userData.healthBar = null;
             }
+            
+            // Clean up voice chat connection
+            if (window.voiceChatHandlers && window.voiceChatHandlers.cleanupPeerConnection) {
+                window.voiceChatHandlers.cleanupPeerConnection(playerId);
+            }
+            
             otherPlayers.delete(playerId);
             updatePlayerCount();
         }
@@ -5253,16 +6951,35 @@ function connectToServer() {
         }
     });
     
+    // Setup voice chat socket handlers
+    if (window.voiceChatSetupSocketHandlers) {
+        window.voiceChatSetupSocketHandlers();
+    }
+    
     socket.on('healPlayer', () => {
         playerHealth = maxHealth;
         updateHealthBar();
     });
     
     socket.on('killPlayer', () => {
+        // This is now handled by playerDied event, but keep for backwards compatibility
         playerHealth = 0;
         updateHealthBar();
         if (localPlayer) {
             localPlayer.visible = false;
+            // Close emote menu if open
+            if (emoteMenuOpen) {
+                closeEmoteMenu();
+            }
+            // Stop any active emote when player dies
+            if (currentEmote) {
+                stopEmote(localPlayer);
+                currentEmote = null;
+                emoteStartTime = 0;
+                if (socket) {
+                    socket.emit('playerEmote', { emote: null });
+                }
+            }
         }
     });
 
@@ -5300,20 +7017,75 @@ function connectToServer() {
             // Local player took damage
             playerHealth = Math.max(0, playerHealth - data.damage);
             updateHealthBar();
+            // Hide immediately when health reaches 0
+            if (playerHealth <= 0 && localPlayer) {
+                localPlayer.visible = false;
+                // Close emote menu if open
+                if (emoteMenuOpen) {
+                    closeEmoteMenu();
+                }
+                // Stop any active emote when player dies
+                if (currentEmote) {
+                    stopEmote(localPlayer);
+                    currentEmote = null;
+                    emoteStartTime = 0;
+                    if (socket) {
+                        socket.emit('playerEmote', { emote: null });
+                    }
+                }
+            }
         } else {
             // Other player took damage
             const player = otherPlayers.get(data.playerId);
             if (player) {
                 player.userData.health = Math.max(0, (player.userData.health || maxHealth) - data.damage);
                 updateHealthBar();
+                // Hide immediately when health reaches 0
+                if (player.userData.health <= 0) {
+                    player.visible = false;
+                    // Remove health bar
+                    if (player.userData.healthBar) {
+                        if (player.userData.healthBar.parentNode) {
+                            player.userData.healthBar.parentNode.removeChild(player.userData.healthBar);
+                        }
+                        player.userData.healthBar = null;
+                    }
+                }
             }
         }
     });
 
     socket.on('playerDied', (data) => {
+        // Hide player IMMEDIATELY before doing anything else
+        if (data.playerId === socket.id) {
+            // Local player died - hide immediately
+            if (localPlayer) {
+                localPlayer.visible = false;
+            }
+            playerHealth = 0;
+            isRagdoll = false; // Reset ragdoll state
+            ragdollTime = 0;
+            velocity.set(0, 0, 0); // Reset velocity
+            updateHealthBar();
+        } else {
+            // Other player died - hide immediately
+            const player = otherPlayers.get(data.playerId);
+            if (player) {
+                player.visible = false;
+                player.userData.health = 0;
+                // Remove health bar
+                if (player.userData.healthBar) {
+                    if (player.userData.healthBar.parentNode) {
+                        player.userData.healthBar.parentNode.removeChild(player.userData.healthBar);
+                    }
+                    player.userData.healthBar = null;
+                }
+            }
+        }
+        
         const deathPos = data.deathPosition ? 
             new THREE.Vector3(data.deathPosition.x, data.deathPosition.y, data.deathPosition.z) :
-            (data.playerId === socket.id ? localPlayer.position.clone() : otherPlayers.get(data.playerId)?.position.clone());
+            (data.playerId === socket.id ? (localPlayer ? localPlayer.position.clone() : new THREE.Vector3(0, 5, 0)) : otherPlayers.get(data.playerId)?.position.clone());
         
         if (!deathPos) return;
         
@@ -5333,43 +7105,25 @@ function connectToServer() {
                 isDeathAnimationPlaying = false;
             }, 3000); // 3 seconds
         }
-        
-        if (data.playerId === socket.id) {
-            // Local player died
-            playerHealth = maxHealth;
-            
-            // Hide player during respawn
-            localPlayer.visible = false;
-            // Hide health bar
-            updateHealthBar();
-        } else {
-            // Other player died
-            const player = otherPlayers.get(data.playerId);
-            if (player) {
-                player.userData.health = maxHealth;
-                
-                // Hide player during respawn
-                player.visible = false;
-                // Remove health bar
-                if (player.userData.healthBar) {
-                    if (player.userData.healthBar.parentNode) {
-                        player.userData.healthBar.parentNode.removeChild(player.userData.healthBar);
-                    }
-                    player.userData.healthBar = null;
-                }
-            }
-        }
     });
 
     socket.on('playerRespawned', (data) => {
         if (data.playerId === socket.id) {
             // Local player respawned
+            playerHealth = maxHealth;
+            isRagdoll = false;
+            ragdollTime = 0;
+            velocity.set(0, 0, 0);
+            canJump = false;
             localPlayer.position.set(data.position.x, data.position.y, data.position.z);
             localPlayer.visible = true;
+            updateHealthBar();
         } else {
             // Other player respawned
             const player = otherPlayers.get(data.playerId);
             if (player) {
+                player.userData.health = maxHealth;
+                player.userData.ragdoll = false;
                 player.position.set(data.position.x, data.position.y, data.position.z);
                 player.visible = true;
             }
@@ -6126,73 +7880,122 @@ function updatePlayerMovement(delta) {
     }
 }
 
-// Update third-person camera
+// Update camera (first-person or third-person)
 function updateCamera() {
     if (!localPlayer) return;
 
     const playerPos = localPlayer.position.clone();
     
-    // Calculate camera position behind player with pitch
-    const horizontalDistance = cameraDistance * Math.cos(cameraPitch);
-    const verticalOffset = cameraHeight + cameraDistance * Math.sin(cameraPitch);
-    
-    // Base desired camera offset (behind player)
-    const cameraOffset = new THREE.Vector3(
-        Math.sin(cameraAngle) * horizontalDistance,
-        verticalOffset,
-        Math.cos(cameraAngle) * horizontalDistance
-    );
+    if (isFirstPerson) {
+        // First-person view: camera at player's head/eye level
+        const eyeHeight = 1.6; // Eye level height (adjust as needed)
+        const eyePos = playerPos.clone();
+        eyePos.y += eyeHeight;
+        
+        // Keep player model visible in first-person view
+        
+        // Move camera forward when sprinting (body leans forward, head moves forward)
+        const playerRotation = localPlayer.rotation.y;
+        const forwardX = Math.sin(playerRotation);
+        const forwardZ = Math.cos(playerRotation);
+        
+        // Get body rotation to calculate forward offset when sprinting
+        const bodyTilt = localPlayer.userData.body ? localPlayer.userData.body.rotation.x : 0;
+        
+        // Calculate forward offset based on body lean
+        // Head is positioned at y=0.78 relative to body center
+        // When body rotates forward (positive rotation.x), head moves forward
+        // Forward offset = headHeight * sin(bodyRotation) * multiplier for more movement
+        const headHeightFromBodyCenter = 0.78; // Head y position relative to body center
+        const forwardOffsetMultiplier = 1.5; // Increase forward movement
+        const forwardOffset = Math.sin(bodyTilt) * headHeightFromBodyCenter * forwardOffsetMultiplier;
+        
+        eyePos.x += forwardX * forwardOffset;
+        eyePos.z += forwardZ * forwardOffset;
+        
+        // Position camera at eye level (with forward offset)
+        camera.position.lerp(eyePos, 0.2);
+        
+        // Camera rotation matches player rotation + camera pitch
+        const lookDistance = 10;
+        const lookAtPos = eyePos.clone();
+        lookAtPos.x += forwardX * lookDistance * Math.cos(cameraPitch);
+        lookAtPos.z += forwardZ * lookDistance * Math.cos(cameraPitch);
+        lookAtPos.y += Math.sin(cameraPitch) * lookDistance;
+        
+        camera.lookAt(lookAtPos);
+    } else {
+        // Show player model in third-person
+        if (localPlayer.visible !== false) {
+            localPlayer.traverse((child) => {
+                if (child instanceof THREE.Mesh) {
+                    child.visible = true; // Show all parts
+                }
+            });
+        }
+        // Third-person view: camera behind player
+        // Calculate camera position behind player with pitch
+        const horizontalDistance = cameraDistance * Math.cos(cameraPitch);
+        const verticalOffset = cameraHeight + cameraDistance * Math.sin(cameraPitch);
+        
+        // Base desired camera offset (behind player)
+        const cameraOffset = new THREE.Vector3(
+            Math.sin(cameraAngle) * horizontalDistance,
+            verticalOffset,
+            Math.cos(cameraAngle) * horizontalDistance
+        );
 
-    // Desired camera position before collision
-    const desiredPos = playerPos.clone().add(cameraOffset);
+        // Desired camera position before collision
+        const desiredPos = playerPos.clone().add(cameraOffset);
 
-    // ==== CAMERA COLLISION WITH GROUND & BLOCKS ====
-    // Raycast from player toward desired camera position
-    const rayOrigin = playerPos.clone();
-    // Raise origin a bit to be closer to head height
-    rayOrigin.y += 1.0;
-    const rayDirection = desiredPos.clone().sub(rayOrigin);
-    const distance = rayDirection.length();
-    if (distance > 0.0001) {
-        rayDirection.normalize();
+        // ==== CAMERA COLLISION WITH GROUND & BLOCKS ====
+        // Raycast from player toward desired camera position
+        const rayOrigin = playerPos.clone();
+        // Raise origin a bit to be closer to head height
+        rayOrigin.y += 1.0;
+        const rayDirection = desiredPos.clone().sub(rayOrigin);
+        const distance = rayDirection.length();
+        if (distance > 0.0001) {
+            rayDirection.normalize();
 
-        // Build list of collision objects: all blocks + ground (objects with userData.isGround)
-        const collisionObjects = [];
-        blocks.forEach(block => {
-            collisionObjects.push(block);
-        });
-        scene.children.forEach(obj => {
-            if (obj.userData && obj.userData.isGround) {
-                collisionObjects.push(obj);
+            // Build list of collision objects: all blocks + ground (objects with userData.isGround)
+            const collisionObjects = [];
+            blocks.forEach(block => {
+                collisionObjects.push(block);
+            });
+            scene.children.forEach(obj => {
+                if (obj.userData && obj.userData.isGround) {
+                    collisionObjects.push(obj);
+                }
+            });
+
+            cameraRaycaster.set(rayOrigin, rayDirection);
+            cameraRaycaster.far = distance;
+            const hits = cameraRaycaster.intersectObjects(collisionObjects, false);
+
+            let targetPos;
+            if (hits.length > 0) {
+                // Move camera to just in front of the first hit point
+                const hitPoint = hits[0].point.clone();
+                targetPos = hitPoint.add(rayDirection.clone().multiplyScalar(-CAMERA_COLLISION_PADDING));
+            } else {
+                targetPos = desiredPos;
             }
-        });
 
-        cameraRaycaster.set(rayOrigin, rayDirection);
-        cameraRaycaster.far = distance;
-        const hits = cameraRaycaster.intersectObjects(collisionObjects, false);
+            // Prevent camera from going below ground
+            const minCameraY = 0.3; // Slightly above ground level
+            if (targetPos.y < minCameraY) {
+                targetPos.y = minCameraY;
+            }
 
-        let targetPos;
-        if (hits.length > 0) {
-            // Move camera to just in front of the first hit point
-            const hitPoint = hits[0].point.clone();
-            targetPos = hitPoint.add(rayDirection.clone().multiplyScalar(-CAMERA_COLLISION_PADDING));
-        } else {
-            targetPos = desiredPos;
+            camera.position.lerp(targetPos, 0.1);
         }
 
-        // Prevent camera from going below ground
-        const minCameraY = 0.3; // Slightly above ground level
-        if (targetPos.y < minCameraY) {
-            targetPos.y = minCameraY;
-        }
-
-        camera.position.lerp(targetPos, 0.1);
+        // Look at player (with slight height offset)
+        const lookAtPos = playerPos.clone();
+        lookAtPos.y += 1.5;
+        camera.lookAt(lookAtPos);
     }
-
-    // Look at player (with slight height offset)
-    const lookAtPos = playerPos.clone();
-    lookAtPos.y += 1.5;
-    camera.lookAt(lookAtPos);
 }
 
 // Check for nearby interactive blocks (doors, signs) and cars
@@ -7520,6 +9323,21 @@ function enterCar(car, seatIndex) {
     if (!car || !localPlayer || seatIndex < 0 || seatIndex > 3) return;
     if (car.userData.seats[seatIndex] !== null) return; // Seat occupied
     
+    // Close emote menu if open
+    if (emoteMenuOpen) {
+        closeEmoteMenu();
+    }
+    
+    // Stop any active emote when entering car
+    if (currentEmote) {
+        stopEmote(localPlayer);
+        currentEmote = null;
+        emoteStartTime = 0;
+        if (socket) {
+            socket.emit('playerEmote', { emote: null });
+        }
+    }
+    
     currentCar = car;
     carSeatIndex = seatIndex;
     car.userData.seats[seatIndex] = localPlayer;
@@ -7608,9 +9426,50 @@ function animate() {
     // Check for nearby interactive blocks and update UI
     checkNearbyInteractiveBlocks();
     updateSignBubbles();
+    
+    // Update voice chat volumes based on distance
+    if (window.updateVoiceChatVolumes) {
+        window.updateVoiceChatVolumes();
+    }
 
     // Update animations
     if (localPlayer) {
+        // Update animation mixer if using imported animations
+        if (localPlayer.userData.animationMixer) {
+            localPlayer.userData.animationMixer.update(delta);
+            applyBoneRotationsToModel(localPlayer);
+        }
+        
+        // Check if local player is moving - stop non-looping emotes when moving and close menu
+        const isMoving = moveState.forward || moveState.backward || moveState.left || moveState.right;
+        if (isMoving) {
+            // Close emote menu if open
+            if (emoteMenuOpen) {
+                closeEmoteMenu();
+            }
+            // Stop non-looping emotes when player starts moving
+            if (currentEmote && currentEmote !== 'gangnam') {
+                stopEmote(localPlayer);
+                currentEmote = null;
+                emoteStartTime = 0;
+                if (socket) {
+                    socket.emit('playerEmote', { emote: null });
+                }
+            }
+        }
+        
+        // Check if local player emote should end (except Gangnam which loops)
+        if (currentEmote && currentEmote !== 'gangnam' && emoteStartTime > 0) {
+            const elapsedTime = (performance.now() - emoteStartTime) / 1000;
+            if (elapsedTime >= EMOTE_DURATIONS[currentEmote]) {
+                stopEmote(localPlayer);
+                currentEmote = null;
+                emoteStartTime = 0;
+                if (socket) {
+                    socket.emit('playerEmote', { emote: null });
+                }
+            }
+        }
         animateStickman(localPlayer, delta);
         updateSpeechBubblePosition(localPlayer);
         updateNameLabelPosition(localPlayer);
@@ -7637,10 +9496,17 @@ function animate() {
                 }
             }
         } else if (player.userData.inCar === null || player.userData.inCar === undefined) {
-            // Make sure player is visible when not in car (unless ragdoll)
-            if (!player.visible && !player.userData.ragdoll) {
+            // Make sure player is visible when not in car (unless ragdoll or dead)
+            const isDead = player.userData.health !== undefined && player.userData.health <= 0;
+            if (!player.visible && !player.userData.ragdoll && !isDead) {
                 player.visible = true;
             }
+        }
+        
+        // Update animation mixer if using imported animations
+        if (player.userData.animationMixer) {
+            player.userData.animationMixer.update(delta);
+            applyBoneRotationsToModel(player);
         }
         
         animateStickman(player, delta);
